@@ -1,0 +1,10 @@
+[
+  "config_manager_test.py::TestConfigManager::()::test_setup_and_get_option",
+  "config_manager_test.py::TestConfigManager::()::test_get_nonexistent_option",
+  "config_manager_test.py::TestConfigManager::()::test_read_custom_yml_conf",
+  "config_manager_test.py::TestConfigManager::()::test_sys_environment",
+  "config_manager_test.py::TestConfigManager::()::test_empty_value",
+  "config_manager_test.py::TestConfigManager::()::test_return_empty_config",
+  "config_manager_test.py::TestConfigManager::()::test_boolean_from_file",
+  "config_manager_test.py::TestConfigManager::()::test_boolean_from_sys_env"
+]

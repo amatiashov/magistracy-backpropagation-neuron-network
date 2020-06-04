@@ -1,0 +1,73 @@
+---
+APPLICATION:
+- name: log_level
+  value: DEBUG
+  sys_environment: APP_LOG_LEVEl
+  required: True
+- name: log_folder
+  value: logs
+  sys_environment: APP_LOG_FOLDER
+- name: name
+  value: Neuron Server
+  sys_environment: APP_NAME
+
+
+REST_API:
+- name: image_folder
+  value: images
+  sys_environment: REST_API_IMAGE_FOLDER
+- name: file_topology
+  value: IMAGES_BMP[55-60-10].json
+  sys_environment: TOPOLOGY_FILE_NAME
+- name: json_web_secret
+  sys_environment: JWT_SECRET
+- name: jwt_expiration_delta_hours
+  value: 1
+  sys_environment: JWT_EXPIRATION_DELTA_HOURS
+- name: server_banner
+  value: banner
+- name: save_images
+  value: false
+  sys_environment: SAVE_IMAGES
+
+NOTIFICATION_ENGINE:
+# Should the server send notification about trying to access?
+- name: notification
+  value: true
+  sys_environment: NOTIFICATION_ENGINE
+
+STORE:
+- name: store_type
+  value: FILE_SYSTEM
+  sys_environment: STORE_TYPE
+
+FILE_STORE:
+- name: base_folder
+  value: repository/states
+  sys_environment: FILE_STORE_BASE_FOLDER
+
+TELEGRAM_BOT:
+- name: access_token
+  sys_environment: TELEGRAM_ACCES_TOKEN
+- name: chat_id
+  sys_environment: TELEGRAM_CHAT_ID
+
+MONGODB:
+- name: user
+  value: mongo
+  sys_environment: MONGODB_USER
+- name: password
+  value: password
+  sys_environment: MONGODB_PASSWORD
+- name: host
+  value: localhost
+  sys_environment: MONGODB_HOST
+- name: port
+  value: 27018
+  sys_environment: MONGODB_PORT
+- name: authsource
+  value: admin
+  sys_environment: MONGODB_AUTHSOURCE
+- name: db_name
+  value: neuron
+  sys_environment: MONGODB_DB_NAME

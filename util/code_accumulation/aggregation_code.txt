@@ -1,0 +1,4496 @@
+======================
+/next/external_checks/example.py
+import logging
+
+
+class ExampleCheck(object):
+    _logger = None
+    order = 2
+    skip = True  # This class is just for example
+
+    def __init__(self):
+        self._logger = logging.getLogger(__name__)
+
+    def do_check(self, configuration):
+        """
+        INT_PARAM must be defined in SPACE_NAME section and
+        be more than 1000.
+        :param configuration:
+        :return:
+        """
+        space = configuration.get("SPACE_NAME")
+        if not space:
+            raise AttributeError("<SPACE_NAME> must be defined!")
+        param = space.get("INT_PARAM")
+        if not param:
+            raise AttributeError("<INT_PARAM> must be defined!")
+        if param < 1000:
+            msg = "INT_PARAM must be more than 1000"
+            self._logger.error(msg)
+            raise ValueError(msg)
+======================
+
+
+======================
+/next/external_checks/store_type_check.py
+import logging
+from store.service.store_service import store_type_mapping
+
+
+class StoreTypeCheck(object):
+    _logger = None
+    order = 1
+
+    def __init__(self):
+        self._logger = logging.getLogger(__name__)
+
+    def do_check(self, configuration):
+        conf = configuration.get("STORE")
+        if conf.get("store_type") not in store_type_mapping:
+            msg = "Store type <%s> is not supported!" % conf.get("store_type")
+            self._logger.error(msg)
+            raise ValueError(msg)
+======================
+
+
+======================
+/next/next.py
+import os
+import sys
+import yaml
+import json
+import logging
+from configparser import ConfigParser
+from importlib.util import module_from_spec
+from importlib.util import spec_from_file_location
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESOURCES_DIR = os.path.join(BASE_DIR, "resources")
+TESTS_RESOURCES_DIR = os.path.join(BASE_DIR, "tests", "resources")
+
+
+if sys.version_info >= (3, 0):
+    import builtins
+    _global_object = builtins
+else:
+    import __builtin__
+    _global_object = __builtin__
+
+
+class Next(object):
+    _config = None
+    _logger = None
+    _instance = None
+    _config_path = None
+    _current_dir = None
+    _external_check_folder = None
+
+    @classmethod
+    def get_instance(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls, *args, **kwargs)
+            cls.__init__(cls._instance, *args, **kwargs)
+        return cls._instance
+
+    def __init__(self, config_path=None, external_check=True, external_check_folder="external_checks"):
+        self._current_dir = os.path.dirname(os.path.abspath(__file__))
+        self._external_check = external_check
+        self._external_check_folder = external_check_folder
+        self._config_path = config_path
+        self._logger = logging.getLogger(__name__)
+        self._config = ConfigParser()
+        self._config.read(os.environ.get("CONFIG_PATH", os.path.join(self._current_dir, "descriptors", "config.ini")))
+        self._config = {s: dict(self._config.items(s)) for s in self._config.sections()}
+        self._check_config_health()
+        self._configure_logging()
+        # check configuration
+        if external_check:
+            self._do_external_checks()
+
+    def get(self, section_name=None):
+        if not section_name:
+            return self._config
+        return self._config.get(section_name, dict())
+
+    def _check_config_health(self):
+        default_conf = self._get_default_config()
+        for section in default_conf:
+            parameters = default_conf.get(section)
+            if not self._config.get(section):
+                self._config[section] = dict()
+            config = self._config[section]
+            for param in parameters:
+                name = param["name"]
+                default = param.get("value", None)
+                required = param.get("required", True)
+                config[name] = config.get(name, default)
+                environment = param.get("sys_environment", None)
+                if environment:
+                    config[name] = os.environ.get(environment, config[name])
+                    self._check_int(config, name)
+                    self._check_boolean_value(config, name)
+                if config[name] is None and required:
+                    msg = "\n%s\n" % json.dumps(config, indent=4)
+                    msg += "You have to define the '%s' variable in the '%s' section!" % (name, section)
+                    if environment:
+                        msg = msg[:-1] + " or define the '%s' system variable!" % environment
+                    raise ValueError(msg)
+
+    def _get_default_config(self):
+        if not self._config_path:
+            self._config_path = os.path.join(self._current_dir, "descriptors", "config.yml")
+        if self._config_path.endswith(".json"):
+            return self._get_default_config_from_json()
+        if self._config_path.endswith(".yaml") or self._config_path.endswith(".yml"):
+            return self._get_default_config_from_yaml()
+        # if file is not supported throw exception
+        error_msg = "Default config must be json or yaml!"
+        self._logger.error(error_msg)
+        raise RuntimeError(error_msg)
+
+    def _get_default_config_from_yaml(self):
+        # try to get default config from yaml file
+        with open(self._config_path) as stream:
+            self._logger.info("Found file config.yml")
+            return yaml.load(stream)
+
+    def _get_default_config_from_json(self):
+        # try to get default config from json file
+        with open(self._config_path, encoding="utf-8") as f:
+            self._logger.info("Found file config.json")
+            return json.loads(f.read())
+
+    def _configure_logging(self):
+        log_folder = os.path.join(BASE_DIR, self.get("APPLICATION").get("log_folder"))
+        log_file_name = "log.txt"
+        log_level = {
+            "INFO": logging.INFO,
+            "DEBUG": logging.DEBUG,
+            "ERROR": logging.ERROR,
+            "CRITICAL": logging.CRITICAL
+        }
+        if not os.path.exists(os.path.join(BASE_DIR, log_folder)):
+            os.makedirs(log_folder)
+        logging.basicConfig(
+            format=u'%(filename)s\t[LINE:%(lineno)d]# %(levelname)-8s\t [%(asctime)s]  %(message)s',
+            level=log_level[Next.get_instance().get("APPLICATION")["log_level"]])
+            # filename=os.path.join(log_folder, log_file_name))
+
+    @staticmethod
+    def _check_boolean_value(config, name):
+        mapping = {"true": True, "false": False}
+        if isinstance(config.get(name), str) and config.get(name).lower() in mapping:
+            config[name] = mapping.get(config.get(name).lower())
+
+    @staticmethod
+    def _check_int(config, name):
+        if isinstance(config.get(name), str):
+            try:
+                    config[name] = int(config.get(name))
+            except Exception:
+                pass
+
+    def _do_external_checks(self):
+        registry = []
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        if not os.path.exists(os.path.join(current_dir, self._external_check_folder)):
+            self._logger.error("There is no external check folder %s" % self._external_check_folder)
+            return
+        checkers = os.listdir(os.path.join(current_dir, self._external_check_folder))
+        checkers = [_ for _ in checkers if not _.startswith("__") and _.endswith(".py")]
+        for checker in checkers:
+            spec = spec_from_file_location(checker[:-3],
+                                           os.path.join(current_dir, self._external_check_folder, checker))
+            check_module = module_from_spec(spec)
+            spec.loader.exec_module(check_module)
+            notify_classes = [_ for _ in dir(check_module) if not _.startswith("__") and _.endswith("Check")]
+            for cls in notify_classes:
+                obj = getattr(check_module, cls)()
+                if not getattr(obj, "skip", False):
+                    registry.append(obj)
+        # sorting checkers by its order
+        len_registry = len(registry)
+        registry.sort(key=lambda check_obj: getattr(check_obj, "order", len_registry), reverse=False)
+        self._logger.info("Start external check...")
+        for checker in registry:
+            if hasattr(checker, "do_check"):
+                self._logger.info("Do %s check" % checker.__class__.__name__)
+                checker.do_check(self._config)
+
+
+def set_option(name, value):
+    setattr(_global_object, name, value)
+
+
+def get_option(name):
+    return getattr(_global_object, name, "")
+======================
+
+
+======================
+/util/jwk.py
+import random
+import string
+
+
+def gen_secret(length=100):
+    """
+    Generate random string including ascii and digits
+    :param length: length result string
+    :return: random string
+    """
+    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
+
+
+print(gen_secret())
+
+======================
+
+
+======================
+/util/id_generator.py
+from hashlib import md5
+
+
+def generate_id(identifier):
+    if identifier is None:
+        raise ValueError("Identifier must be not null")
+    # пример генерации взят отсюда
+    # http://stackoverflow.com/questions/5297448/how-to-get-md5-sum-of-a-string
+    return md5(identifier.encode('utf-8')).hexdigest()
+======================
+
+
+======================
+/util/easyTables.py
+# coding: UTF-8;
+from sys import stdout
+
+
+class EasyTables(object):
+    def __init__(self, titles=[], header= True, rows_count= 0):
+        if not header:
+            self.rows_count = rows_count
+        else:
+            self.rows_count = 0
+        self.max_leng_in_row = []
+        self.title_of_rows = []
+        self.data_in_rows = []
+        self.head = header
+        if titles and header:
+            self.add_title(titles)
+        if not header:
+            self.max_leng_in_row.extend([0] * rows_count)
+
+    def add_title(self, titles):
+        for word in titles:
+            word = str(word).rstrip().lstrip()
+            self.title_of_rows.append(word)
+            self.rows_count += 1
+            self.max_leng_in_row.append(len(word))
+
+    def add_row(self, value):
+        if self.rows_count < 1 and self.head:
+            print ('Firs, add headers!')
+        else:
+            if len(value) != self.rows_count:
+                print ('Wrong number of columns!')
+                print ('requires: ', self.rows_count)
+                print ('received: ', len(value))
+            else:
+                self.data_in_rows.append([])
+                for i in range(len(value)):
+                    data = str(value[i])
+                    if len(data) > self.max_leng_in_row[i]:
+                        self.max_leng_in_row[i] = len(data)
+                    self.data_in_rows[-1].append(data)
+
+    def print_title(self):
+        for i in range(len(self.title_of_rows)):
+            stdout.write('+' + '-' * (self.max_leng_in_row[i] + 2))
+        stdout.write('+\n')
+
+        for i in range(len(self.title_of_rows)):
+            stdout.write('| ' + self.title_of_rows[i] + ' ' * (self.max_leng_in_row[i] - len(self.title_of_rows[i]) + 1))
+        stdout.write('|\n')
+
+        for i in range(len(self.title_of_rows)):
+            stdout.write('+' + '-' * (self.max_leng_in_row[i] + 2))
+        stdout.write('+\n')
+
+    def get_column(self, column_name):
+        column = []
+        index_column_in_table = self.title_of_rows.index(column_name)
+        for word in self.data_in_rows:
+            column.append(word[index_column_in_table])
+        return column
+
+    def print_data(self):
+        if not self.head:
+            for i in range(self.rows_count):
+                stdout.write('+' + '-' * (self.max_leng_in_row[i] + 2))
+            stdout.write('+\n')
+
+        for string in self.data_in_rows:
+            for i in range(len(string)):
+                stdout.write('| ' + string[i] + ' ' * (self.max_leng_in_row[i] - len(string[i]) + 1))
+            stdout.write('|\n')
+
+        for i in range(self.rows_count):
+            stdout.write('+' + '-' * (self.max_leng_in_row[i] + 2))
+        stdout.write('+\n')
+
+    def display(self):
+        if self.rows_count > 0:
+            if self.head:
+                self.print_title()
+                self.print_data()
+            else:
+                self.print_data()======================
+
+
+======================
+/util/parser.py
+
+class NumberParser(object):
+    """
+        Данный метод возвращает массив, содержащий информацию о шаблоне.
+        Формат файла шаблона:
+        I строка - имя шаблона
+        II строка - пустая строка
+        последующие строки содержат матрицу символов - сам шаблон
+        Если символ матрицы входит в template, то в результирующий массив data
+        добавляется 1, иначе 0
+    """
+    @staticmethod
+    def parse(path_to_template):
+        data = []
+        template = ["|", "/", "\\", "-"]
+        file = open(path_to_template, encoding="utf-8")
+        head = file.readline().rstrip()
+        file.readline()
+        for line in file:
+            for char in line.rstrip():
+                if char in template:
+                    data.append(1)
+                else:
+                    data.append(0)
+        return [data, head]
+======================
+
+
+======================
+/util/bmp.py
+import logging
+from PIL import Image
+from math import sqrt
+
+logger = logging.getLogger(__name__)
+
+images_cache = dict()
+
+
+def bmp_to_binary(src, cache=True):
+    """
+    Функция представления изображения в формате bmp в виде
+    массива нулей и единиц (1 - черный цвет, 0 - белый)
+    :param src: путь к файлу bmp
+    :return: list
+    """
+    if cache:
+        if src in images_cache:
+            logger.info("Use cache for %s" % src)
+            return images_cache.get(src)
+    logger.debug("Opening image by path %s" % src)
+    img = Image.open(src)
+    pixels = img.load()
+    image_bin = []
+    for i in range(img.size[0]):
+        for j in range(img.size[1]):
+            value = 0 if pixels[i, j] == 255 else 1
+            image_bin.append(value)
+    images_cache[src] = image_bin
+    return image_bin
+
+
+def show_bmp(array, reverse=False):
+    """
+    Функция для представления списка нулей и единиц в виде bmp изображения.
+    :param array: список нулей и единиц
+    :param reverse: инвертирование белых и черных пикселей
+    :return: 
+    """
+    size = int(sqrt(len(array)))
+    img = Image.new('1', (size, size))
+    pixels = img.load()
+    for i in range(img.size[0]):
+        for j in range(img.size[1]):
+            if reverse:
+                pixels[i, j] = 0 if array.pop(0) else 1
+            else:
+                pixels[i, j] = array.pop(0)
+    img.show()
+======================
+
+
+======================
+/util/network_aggregation.py
+import json
+import logging
+from entities.backpropagation.layer import Layer
+from entities.backpropagation.network import Network
+
+logger = logging.getLogger(__name__)
+
+
+def create_net_from_json(fp):
+    """
+    Выполняет парсинг json файла и подготавливает все необходимы данные для
+    дальнейшей работы
+    :param fp: путь к файлу json
+    :return: dict, содержащий объект Network и пути к служебным каталогам
+    """
+
+    logger.debug("Opening network topology %s" % fp)
+    with open(fp) as f:
+        data = json.loads(f.read())
+
+    logger.debug(json.dumps(data, indent=4, ensure_ascii=False))
+
+    network_name = data["network"]["name"]
+    logger.debug("network name: %s", network_name)
+    layers_description = network_name[network_name.index("[") + 1: network_name.index("]")]
+    layers_description = layers_description.split("-")
+    layers_description = list(map(lambda x: int(x), layers_description))
+
+    layers = [Layer(name=network_name + "#0",
+                    number_of_input_signal=data["network"]["input_size"],
+                    number_neurons_in_layer=layers_description[0])]
+    for i in range(1, len(layers_description)):
+        layer = Layer(name=network_name + "#" + str(i),
+                      number_of_input_signal=layers_description[i - 1],
+                      number_neurons_in_layer=layers_description[i])
+        layers.append(layer)
+
+    rate = None
+    if not data["network"].get("auto_rate"):
+        rate = data["network"]["rate"]
+
+    network = Network(auto_correct_learn_rate=data["network"].get("auto rate", False),
+                      learn_rate=rate)
+    for layer in layers:
+        network.add_layer(layer)
+    return {"name": network_name, "object": network, "payload": data.get("payload")}
+======================
+
+
+======================
+/util/allowed_file_upload.py
+
+ALLOWED_EXTENSIONS = {"bmp", "jpg"}
+
+
+def allowed_file_upload(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+======================
+
+
+======================
+/util/folder_scaner.py
+import os
+"""
+    Данный метод сканирует целевую папку (target_folder) и формирует
+    список всех файлов, входящих в нее
+"""
+
+
+def folder_scan(target_folder="digit_templates"):
+    file_list = []
+    for file in os.listdir(path=target_folder):
+        if not file.startswith(".") and not file.startswith("README"):
+            file_list.append(file)
+    return file_list
+======================
+
+
+======================
+/main2.py
+import os
+import cv2
+import numpy as np
+from next.next import BASE_DIR
+
+
+def reduce_colors(img, n):
+    Z = img.reshape((-1,3))
+
+    # convert to np.float32
+    Z = np.float32(Z)
+
+    # define criteria, number of clusters(K) and apply kmeans()
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    K = n
+    ret,label,center=cv2.kmeans(Z,K,None,criteria,10,cv2.KMEANS_RANDOM_CENTERS)
+
+    # Now convert back into uint8, and make original image
+    center = np.uint8(center)
+    res = center[label.flatten()]
+    res2 = res.reshape((img.shape))
+
+    return res2
+
+
+def clean_image(img):
+    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    resized_img = cv2.resize(gray_img
+        , None
+        , fx=5.0
+        , fy=5.0
+        , interpolation=cv2.INTER_CUBIC)
+
+    resized_img = cv2.GaussianBlur(resized_img,(5,5),0)
+    cv2.imwrite('licence_plate_large.png', resized_img)
+
+    equalized_img = cv2.equalizeHist(resized_img)
+    cv2.imwrite('licence_plate_equ.png', equalized_img)
+
+
+    reduced = cv2.cvtColor(reduce_colors(cv2.cvtColor(equalized_img, cv2.COLOR_GRAY2BGR), 8), cv2.COLOR_BGR2GRAY)
+    cv2.imwrite('licence_plate_red.png', reduced)
+
+
+    ret, mask = cv2.threshold(reduced, 64, 255, cv2.THRESH_BINARY)
+    cv2.imwrite('licence_plate_mask.png', mask)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.erode(mask, kernel, iterations = 1)
+    cv2.imwrite('licence_plate_mask2.png', mask)
+
+    return mask
+
+
+def extract_characters(img):
+    bw_image = cv2.bitwise_not(img)
+    contours = cv2.findContours(bw_image, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)[1]
+
+    char_mask = np.zeros_like(img)
+    bounding_boxes = []
+    for contour in contours:
+        x,y,w,h = cv2.boundingRect(contour)
+        area = w * h
+        center = (x + w/2, y + h/2)
+        if (area > 1000) and (area < 10000):
+            x,y,w,h = x-4, y-4, w+8, h+8
+            bounding_boxes.append((center, (x,y,w,h)))
+            cv2.rectangle(char_mask,(x,y),(x+w,y+h),255,-1)
+
+    cv2.imwrite('licence_plate_mask3.png', char_mask)
+
+    clean = cv2.bitwise_not(cv2.bitwise_and(char_mask, char_mask, mask = bw_image))
+
+    bounding_boxes = sorted(bounding_boxes, key=lambda item: item[0][0])
+
+    characters = []
+    for center, bbox in bounding_boxes:
+        x,y,w,h = bbox
+        char_image = clean[y:y+h,x:x+w]
+        characters.append((bbox, char_image))
+
+    return clean, characters
+
+
+def highlight_characters(img, chars):
+    output_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    for bbox, char_img in chars:
+        x,y,w,h = bbox
+        cv2.rectangle(output_img,(x,y),(x+w,y+h),255,1)
+
+    return output_img
+
+
+img = cv2.imread(os.path.join(BASE_DIR, "license_plate_recognition", "imgOriginalScene.png"))
+
+img = clean_image(img)
+clean_img, chars = extract_characters(img)
+
+
+output_img = highlight_characters(clean_img, chars)
+cv2.imwrite('licence_plate_out.png', output_img)
+
+
+samples = np.loadtxt('char_samples.data',np.float32)
+responses = np.loadtxt('char_responses.data',np.float32)
+responses = responses.reshape((responses.size,1))
+
+
+model = cv2.ml.KNearest_create()
+model.train(samples, cv2.ml.ROW_SAMPLE, responses)
+
+plate_chars = ""
+for bbox, char_img in chars:
+    small_img = cv2.resize(char_img,(10,10))
+    small_img = small_img.reshape((1,100))
+    small_img = np.float32(small_img)
+    retval, results, neigh_resp, dists = model.findNearest(small_img, k = 1)
+    plate_chars += str(chr((results[0][0])))
+
+print("Licence plate: %s" % plate_chars)======================
+
+
+======================
+/tests/config_manager_test.py
+import os
+import pytest
+from tests.utils import create_conf, delete_conf
+from next.next import TESTS_RESOURCES_DIR, set_option, get_option, Next
+
+
+class TestConfigManager:
+    _created_config_files = list()
+
+    def setup(self):
+        Next._instance = None
+        print("ConfigManager has been reset ...")
+
+    def teardown_class(self):
+        for conf in self._created_config_files:
+            delete_conf(conf)
+
+    def test_setup_and_get_option(self):
+        opt_name = "PARAMETER_NAME"
+        opt_value = "AVOKADO"
+        set_option(opt_name, opt_value)
+        assert get_option(opt_name) == opt_value
+
+    def test_get_nonexistent_option(self):
+        assert get_option("XYbREXpNabQ") == ""
+
+    def test_read_custom_yml_conf(self):
+        conf_obj = dict(
+            TEST_SECTION=[
+                dict(name="test_parameter", value="test_value", sys_environment="TEST_ENV", required=True)
+            ]
+        )
+        conf_name = create_conf(sections=conf_obj)
+        self._created_config_files.append(conf_name)
+        instance = Next.get_instance(config_path=os.path.join(TESTS_RESOURCES_DIR, conf_name),
+                                     external_check=False)
+        configs = instance.get()
+        assert configs.get("TEST_SECTION").get("test_parameter") == "test_value"
+
+    def test_sys_environment(self):
+        conf_obj = dict(
+            TEST_SECTION=[
+                dict(name="test_parameter", value="test_value", sys_environment="TEST_ENV", required=True)
+            ]
+        )
+        os.environ["TEST_ENV"] = "test_value_from_env"
+        conf_name = create_conf(sections=conf_obj)
+        self._created_config_files.append(conf_name)
+        instance = Next.get_instance(config_path=os.path.join(TESTS_RESOURCES_DIR, conf_name),
+                                     external_check=False)
+
+        os.environ.pop("TEST_ENV")
+        assert instance.get("TEST_SECTION").get("test_parameter") == "test_value_from_env"
+
+    def test_empty_value(self):
+        conf_obj = dict(
+            TEST_SECTION=[
+                dict(name="test_parameter", sys_environment="TEST_ENV", required=True)
+            ]
+        )
+        conf_name = create_conf(sections=conf_obj)
+        self._created_config_files.append(conf_name)
+        with pytest.raises(ValueError) as e:
+            Next.get_instance(config_path=os.path.join(TESTS_RESOURCES_DIR, conf_name),
+                              external_check=False)
+        error_msg = "You have to define the 'test_parameter' variable in the 'TEST_SECTION' " \
+                    "section or define the 'TEST_ENV' system variable!"
+        assert error_msg in str(e.value)
+
+    def test_return_empty_config(self):
+        conf_obj = dict(
+            TEST_SECTION=[
+                dict(name="test_parameter", value="test_value", sys_environment="TEST_ENV", required=True)
+            ]
+        )
+        conf_name = create_conf(sections=conf_obj)
+        self._created_config_files.append(conf_name)
+        instance = Next.get_instance(config_path=os.path.join(TESTS_RESOURCES_DIR, conf_name),
+                                     external_check=False)
+
+        assert instance.get("nonexistent-conf") == dict()
+
+    def test_boolean_from_file(self):
+        for boolean in [True, False]:
+            self.setup()
+            conf_obj = dict(
+                TEST_SECTION=[
+                    dict(name="BOOLEAN_PARAM", value=boolean, sys_environment="BOOL", required=True)
+                ]
+            )
+            conf_name = create_conf(sections=conf_obj)
+            self._created_config_files.append(conf_name)
+            instance = Next.get_instance(config_path=os.path.join(TESTS_RESOURCES_DIR, conf_name),
+                                         external_check=False)
+            assert instance.get("TEST_SECTION").get("BOOLEAN_PARAM") is boolean
+
+    def test_boolean_from_sys_env(self):
+        mapping = {"true": True, "false": False, "True": True, "False": False}
+        for boolean in mapping:
+            self.setup()
+            os.environ["BOOL"] = boolean
+            conf_obj = dict(
+                TEST_SECTION=[
+                    dict(name="BOOLEAN_PARAM", sys_environment="BOOL", required=True)
+                ]
+            )
+            conf_name = create_conf(sections=conf_obj)
+            self._created_config_files.append(conf_name)
+            instance = Next.get_instance(config_path=os.path.join(TESTS_RESOURCES_DIR, conf_name),
+                                         external_check=False)
+
+            os.environ.pop("BOOL")
+            assert instance.get("TEST_SECTION").get("BOOLEAN_PARAM") is mapping.get(boolean)
+======================
+
+
+======================
+/tests/utils.py
+import os
+import yaml
+import uuid
+from next.next import TESTS_RESOURCES_DIR
+
+base_conf = dict(
+    APPLICATION=[
+        dict(name="log_level", value="DEBUG", sys_environment="APP_LOG_LEVEl", required=True),
+        dict(name="log_folder", value="repository/logs", sys_environment="APP_LOG_FOLDER")
+    ]
+)
+
+if not os.path.exists(TESTS_RESOURCES_DIR):
+    os.makedirs(TESTS_RESOURCES_DIR)
+
+
+def create_conf(*args, **kwargs):
+    conf = dict()
+    if kwargs.get("extend_base_conf", True):
+        conf.update(base_conf)
+    if kwargs.get("sections"):
+        conf.update(kwargs.get("sections"))
+    conf_name = kwargs.get("conf_name", str(uuid.uuid4()) + ".yml")
+    print("Creating config file with name " + conf_name)
+    if conf_name is None:
+        raise RuntimeError("Fill in config name for saving!")
+    print(yaml.dump(conf, default_flow_style=False))
+    with open(os.path.join(TESTS_RESOURCES_DIR, conf_name), "w") as f:
+        yaml.dump(conf, f, default_flow_style=False)
+    return conf_name
+
+
+def delete_conf(conf_name):
+    print("deleting config file: " + os.path.join(TESTS_RESOURCES_DIR, conf_name))
+    os.remove(os.path.join(TESTS_RESOURCES_DIR, conf_name))
+
+======================
+
+
+======================
+/license_plate_recognition/PossiblePlate.py
+
+class PossiblePlate:
+    imgPlate = None
+    imgGrayscale = None
+    imgThresh = None
+    rrLocationOfPlateInScene = None
+    strChars = ""
+======================
+
+
+======================
+/license_plate_recognition/params.py
+# module level variables
+SCALAR_BLACK = (0.0, 0.0, 0.0)
+SCALAR_WHITE = (255.0, 255.0, 255.0)
+SCALAR_YELLOW = (0.0, 255.0, 255.0)
+SCALAR_GREEN = (0.0, 255.0, 0.0)
+SCALAR_RED = (0.0, 0.0, 255.0)
+
+# show_steps = True
+show_steps = False
+======================
+
+
+======================
+/license_plate_recognition/Preprocess.py
+# Preprocess.py
+
+import cv2
+import numpy as np
+
+# module level variables ##########################################################################
+GAUSSIAN_SMOOTH_FILTER_SIZE = (5, 5)
+ADAPTIVE_THRESH_BLOCK_SIZE = 19
+ADAPTIVE_THRESH_WEIGHT = 9
+
+###################################################################################################
+def preprocess(imgOriginal):
+    imgGrayscale = extractValue(imgOriginal)
+
+    imgMaxContrastGrayscale = maximizeContrast(imgGrayscale)
+
+    height, width = imgGrayscale.shape
+
+    imgBlurred = np.zeros((height, width, 1), np.uint8)
+
+    imgBlurred = cv2.GaussianBlur(imgMaxContrastGrayscale, GAUSSIAN_SMOOTH_FILTER_SIZE, 0)
+
+    imgThresh = cv2.adaptiveThreshold(imgBlurred, 255.0, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, ADAPTIVE_THRESH_BLOCK_SIZE, ADAPTIVE_THRESH_WEIGHT)
+
+    return imgGrayscale, imgThresh
+# end function
+
+###################################################################################################
+def extractValue(imgOriginal):
+    height, width, numChannels = imgOriginal.shape
+
+    imgHSV = np.zeros((height, width, 3), np.uint8)
+
+    imgHSV = cv2.cvtColor(imgOriginal, cv2.COLOR_BGR2HSV)
+
+    imgHue, imgSaturation, imgValue = cv2.split(imgHSV)
+
+    return imgValue
+# end function
+
+###################################################################################################
+def maximizeContrast(imgGrayscale):
+
+    height, width = imgGrayscale.shape
+
+    imgTopHat = np.zeros((height, width, 1), np.uint8)
+    imgBlackHat = np.zeros((height, width, 1), np.uint8)
+
+    structuringElement = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+    imgTopHat = cv2.morphologyEx(imgGrayscale, cv2.MORPH_TOPHAT, structuringElement)
+    imgBlackHat = cv2.morphologyEx(imgGrayscale, cv2.MORPH_BLACKHAT, structuringElement)
+
+    imgGrayscalePlusTopHat = cv2.add(imgGrayscale, imgTopHat)
+    imgGrayscalePlusTopHatMinusBlackHat = cv2.subtract(imgGrayscalePlusTopHat, imgBlackHat)
+
+    return imgGrayscalePlusTopHatMinusBlackHat
+# end function
+
+
+
+
+
+
+
+
+
+
+======================
+
+
+======================
+/license_plate_recognition/DetectPlates.py
+# DetectPlates.py
+
+import cv2
+import numpy as np
+import math
+import random
+
+from license_plate_recognition.params import *
+import Preprocess
+import DetectChars
+import PossiblePlate
+import PossibleChar
+
+# module level variables ##########################################################################
+PLATE_WIDTH_PADDING_FACTOR = 1.3
+PLATE_HEIGHT_PADDING_FACTOR = 1.5
+
+###################################################################################################
+def detectPlatesInScene(imgOriginalScene):
+    listOfPossiblePlates = []                   # this will be the return value
+
+    height, width, numChannels = imgOriginalScene.shape
+
+    imgGrayscaleScene = np.zeros((height, width, 1), np.uint8)
+    imgThreshScene = np.zeros((height, width, 1), np.uint8)
+    imgContours = np.zeros((height, width, 3), np.uint8)
+
+    cv2.destroyAllWindows()
+
+    if show_steps == True: # show steps #######################################################
+        cv2.imshow("0", imgOriginalScene)
+    # end if # show steps #########################################################################
+
+    imgGrayscaleScene, imgThreshScene = Preprocess.preprocess(imgOriginalScene)         # preprocess to get grayscale and threshold images
+
+    if show_steps == True: # show steps #######################################################
+        cv2.imshow("1a", imgGrayscaleScene)
+        cv2.imshow("1b", imgThreshScene)
+    # end if # show steps #########################################################################
+
+            # find all possible chars in the scene,
+            # this function first finds all contours, then only includes contours that could be chars (without comparison to other chars yet)
+    listOfPossibleCharsInScene = findPossibleCharsInScene(imgThreshScene)
+
+    if show_steps == True: # show steps #######################################################
+        print("step 2 - len(listOfPossibleCharsInScene) = " + str(len(listOfPossibleCharsInScene)))         # 131 with MCLRNF1 image
+
+        imgContours = np.zeros((height, width, 3), np.uint8)
+
+        contours = []
+
+        for possibleChar in listOfPossibleCharsInScene:
+            contours.append(possibleChar.contour)
+        # end for
+
+        cv2.drawContours(imgContours, contours, -1, SCALAR_WHITE)
+        cv2.imshow("2b", imgContours)
+    # end if # show steps #########################################################################
+
+            # given a list of all possible chars, find groups of matching chars
+            # in the next steps each group of matching chars will attempt to be recognized as a plate
+    listOfListsOfMatchingCharsInScene = DetectChars.findListOfListsOfMatchingChars(listOfPossibleCharsInScene)
+
+    if show_steps == True: # show steps #######################################################
+        print("step 3 - listOfListsOfMatchingCharsInScene.Count = " + str(len(listOfListsOfMatchingCharsInScene)))    # 13 with MCLRNF1 image
+
+        imgContours = np.zeros((height, width, 3), np.uint8)
+
+        for listOfMatchingChars in listOfListsOfMatchingCharsInScene:
+            intRandomBlue = random.randint(0, 255)
+            intRandomGreen = random.randint(0, 255)
+            intRandomRed = random.randint(0, 255)
+
+            contours = []
+
+            for matchingChar in listOfMatchingChars:
+                contours.append(matchingChar.contour)
+            # end for
+
+            cv2.drawContours(imgContours, contours, -1, (intRandomBlue, intRandomGreen, intRandomRed))
+        # end for
+
+        cv2.imshow("3", imgContours)
+    # end if # show steps #########################################################################
+
+    for listOfMatchingChars in listOfListsOfMatchingCharsInScene:                   # for each group of matching chars
+        possiblePlate = extractPlate(imgOriginalScene, listOfMatchingChars)         # attempt to extract plate
+
+        if possiblePlate.imgPlate is not None:                          # if plate was found
+            listOfPossiblePlates.append(possiblePlate)                  # add to list of possible plates
+        # end if
+    # end for
+
+    print("\n" + str(len(listOfPossiblePlates)) + " possible plates found")          # 13 with MCLRNF1 image
+
+    if show_steps:
+        print("")
+        cv2.imshow("4a", imgContours)
+
+        for i in range(0, len(listOfPossiblePlates)):
+            p2fRectPoints = cv2.boxPoints(listOfPossiblePlates[i].rrLocationOfPlateInScene)
+
+            cv2.line(imgContours, tuple(p2fRectPoints[0]), tuple(p2fRectPoints[1]), SCALAR_RED, 2)
+            cv2.line(imgContours, tuple(p2fRectPoints[1]), tuple(p2fRectPoints[2]), SCALAR_RED, 2)
+            cv2.line(imgContours, tuple(p2fRectPoints[2]), tuple(p2fRectPoints[3]), SCALAR_RED, 2)
+            cv2.line(imgContours, tuple(p2fRectPoints[3]), tuple(p2fRectPoints[0]), SCALAR_RED, 2)
+
+            cv2.imshow("4a", imgContours)
+
+            print("possible plate " + str(i) + ", click on any image and press a key to continue . . .")
+
+            cv2.imshow("4b", listOfPossiblePlates[i].imgPlate)
+            cv2.waitKey(0)
+        # end for
+
+        print("\nplate detection complete, click on any image and press a key to begin char recognition . . .\n")
+        cv2.waitKey(0)
+    # end if # show steps #########################################################################
+
+    return listOfPossiblePlates
+# end function
+
+###################################################################################################
+def findPossibleCharsInScene(imgThresh):
+    listOfPossibleChars = []                # this will be the return value
+
+    intCountOfPossibleChars = 0
+
+    imgThreshCopy = imgThresh.copy()
+
+    imgContours, contours, npaHierarchy = cv2.findContours(imgThreshCopy, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)   # find all contours
+
+    height, width = imgThresh.shape
+    imgContours = np.zeros((height, width, 3), np.uint8)
+
+    for i in range(0, len(contours)):                       # for each contour
+
+        if show_steps == True: # show steps ###################################################
+            cv2.drawContours(imgContours, contours, i, SCALAR_WHITE)
+        # end if # show steps #####################################################################
+
+        possibleChar = PossibleChar.PossibleChar(contours[i])
+
+        if DetectChars.checkIfPossibleChar(possibleChar):                   # if contour is a possible char, note this does not compare to other chars (yet) . . .
+            intCountOfPossibleChars = intCountOfPossibleChars + 1           # increment count of possible chars
+            listOfPossibleChars.append(possibleChar)                        # and add to list of possible chars
+        # end if
+    # end for
+
+    if show_steps == True: # show steps #######################################################
+        print("\nstep 2 - len(contours) = " + str(len(contours)))                       # 2362 with MCLRNF1 image
+        print("step 2 - intCountOfPossibleChars = " + str(intCountOfPossibleChars))       # 131 with MCLRNF1 image
+        cv2.imshow("2a", imgContours)
+    # end if # show steps #########################################################################
+
+    return listOfPossibleChars
+# end function
+
+
+###################################################################################################
+def extractPlate(imgOriginal, listOfMatchingChars):
+    possiblePlate = PossiblePlate.PossiblePlate()           # this will be the return value
+
+    listOfMatchingChars.sort(key = lambda matchingChar: matchingChar.intCenterX)        # sort chars from left to right based on x position
+
+            # calculate the center point of the plate
+    fltPlateCenterX = (listOfMatchingChars[0].intCenterX + listOfMatchingChars[len(listOfMatchingChars) - 1].intCenterX) / 2.0
+    fltPlateCenterY = (listOfMatchingChars[0].intCenterY + listOfMatchingChars[len(listOfMatchingChars) - 1].intCenterY) / 2.0
+
+    ptPlateCenter = fltPlateCenterX, fltPlateCenterY
+
+            # calculate plate width and height
+    intPlateWidth = int((listOfMatchingChars[len(listOfMatchingChars) - 1].intBoundingRectX + listOfMatchingChars[len(listOfMatchingChars) - 1].intBoundingRectWidth - listOfMatchingChars[0].intBoundingRectX) * PLATE_WIDTH_PADDING_FACTOR)
+
+    intTotalOfCharHeights = 0
+
+    for matchingChar in listOfMatchingChars:
+        intTotalOfCharHeights = intTotalOfCharHeights + matchingChar.intBoundingRectHeight
+    # end for
+
+    fltAverageCharHeight = intTotalOfCharHeights / len(listOfMatchingChars)
+
+    intPlateHeight = int(fltAverageCharHeight * PLATE_HEIGHT_PADDING_FACTOR)
+
+            # calculate correction angle of plate region
+    fltOpposite = listOfMatchingChars[len(listOfMatchingChars) - 1].intCenterY - listOfMatchingChars[0].intCenterY
+    fltHypotenuse = DetectChars.distanceBetweenChars(listOfMatchingChars[0], listOfMatchingChars[len(listOfMatchingChars) - 1])
+    fltCorrectionAngleInRad = math.asin(fltOpposite / fltHypotenuse)
+    fltCorrectionAngleInDeg = fltCorrectionAngleInRad * (180.0 / math.pi)
+
+            # pack plate region center point, width and height, and correction angle into rotated rect member variable of plate
+    possiblePlate.rrLocationOfPlateInScene = ( tuple(ptPlateCenter), (intPlateWidth, intPlateHeight), fltCorrectionAngleInDeg )
+
+            # final steps are to perform the actual rotation
+
+            # get the rotation matrix for our calculated correction angle
+    rotationMatrix = cv2.getRotationMatrix2D(tuple(ptPlateCenter), fltCorrectionAngleInDeg, 1.0)
+
+    height, width, numChannels = imgOriginal.shape      # unpack original image width and height
+
+    imgRotated = cv2.warpAffine(imgOriginal, rotationMatrix, (width, height))       # rotate the entire image
+
+    imgCropped = cv2.getRectSubPix(imgRotated, (intPlateWidth, intPlateHeight), tuple(ptPlateCenter))
+
+    possiblePlate.imgPlate = imgCropped         # copy the cropped plate image into the applicable member variable of the possible plate
+
+    return possiblePlate
+======================
+
+
+======================
+/license_plate_recognition/DetectChars.py
+# DetectChars.py
+
+import cv2
+import numpy as np
+import math
+import random
+from license_plate_recognition.params import *
+import Preprocess
+import PossibleChar
+import os
+
+kNearest = cv2.ml.KNearest_create()
+
+# constants for checkIfPossibleChar, this checks one possible char only (does not compare to another char)
+MIN_PIXEL_WIDTH = 2
+MIN_PIXEL_HEIGHT = 8
+
+MIN_ASPECT_RATIO = 0.25
+MAX_ASPECT_RATIO = 1.0
+
+MIN_PIXEL_AREA = 80
+
+        # constants for comparing two chars
+MIN_DIAG_SIZE_MULTIPLE_AWAY = 0.3
+MAX_DIAG_SIZE_MULTIPLE_AWAY = 5.0
+
+MAX_CHANGE_IN_AREA = 0.5
+
+MAX_CHANGE_IN_WIDTH = 0.8
+MAX_CHANGE_IN_HEIGHT = 0.2
+
+MAX_ANGLE_BETWEEN_CHARS = 12.0
+
+        # other constants
+MIN_NUMBER_OF_MATCHING_CHARS = 3
+
+RESIZED_CHAR_IMAGE_WIDTH = 20
+RESIZED_CHAR_IMAGE_HEIGHT = 30
+
+MIN_CONTOUR_AREA = 100
+
+###################################################################################################
+def loadKNNDataAndTrainKNN():
+    allContoursWithData = []                # declare empty lists,
+    validContoursWithData = []              # we will fill these shortly
+
+    try:
+        # read in training classifications
+        npaClassifications = np.loadtxt("classifications.txt", np.float32)
+    except:                                                                                 # if file could not be opened
+        print("error, unable to open classifications.txt, exiting program")                # show error message
+        os.system("pause")
+        return False                                                                        # and return False
+
+    try:
+        npaFlattenedImages = np.loadtxt("flattened_images.txt", np.float32)                 # read in training images
+    except:                                                                                 # if file could not be opened
+        print("error, unable to open flattened_images.txt, exiting program\n")               # show error message
+        os.system("pause")
+        return False                                                                        # and return False
+    # end try
+
+    npaClassifications = npaClassifications.reshape((npaClassifications.size, 1))       # reshape numpy array to 1d, necessary to pass to call to train
+
+    kNearest.setDefaultK(1)                                                             # set default K to 1
+
+    kNearest.train(npaFlattenedImages, cv2.ml.ROW_SAMPLE, npaClassifications)           # train KNN object
+
+    return True                             # if we got here training was successful so return true
+
+
+def detectCharsInPlates(listOfPossiblePlates):
+    intPlateCounter = 0
+    imgContours = None
+    contours = []
+
+    # if list of possible plates is empty
+    if len(listOfPossiblePlates) == 0:
+        return listOfPossiblePlates
+
+    # at this point we can be sure the list of possible plates has at least one plate
+    for possiblePlate in listOfPossiblePlates:          # for each possible plate, this is a big for loop that takes up most of the function
+
+        # preprocess to get grayscale and threshold images
+        possiblePlate.imgGrayscale, possiblePlate.imgThresh = Preprocess.preprocess(possiblePlate.imgPlate)
+
+        if show_steps == True: # show steps ###################################################
+            cv2.imshow("5a", possiblePlate.imgPlate)
+            cv2.imshow("5b", possiblePlate.imgGrayscale)
+            cv2.imshow("5c", possiblePlate.imgThresh)
+        # end if # show steps #####################################################################
+
+                # increase size of plate image for easier viewing and char detection
+        possiblePlate.imgThresh = cv2.resize(possiblePlate.imgThresh, (0, 0), fx = 1.6, fy = 1.6)
+
+                # threshold again to eliminate any gray areas
+        thresholdValue, possiblePlate.imgThresh = cv2.threshold(possiblePlate.imgThresh, 0.0, 255.0, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        if show_steps == True: # show steps ###################################################
+            cv2.imshow("5d", possiblePlate.imgThresh)
+        # end if # show steps #####################################################################
+
+                # find all possible chars in the plate,
+                # this function first finds all contours, then only includes contours that could be chars (without comparison to other chars yet)
+        listOfPossibleCharsInPlate = findPossibleCharsInPlate(possiblePlate.imgGrayscale, possiblePlate.imgThresh)
+
+        if show_steps == True: # show steps ###################################################
+            height, width, numChannels = possiblePlate.imgPlate.shape
+            imgContours = np.zeros((height, width, 3), np.uint8)
+            del contours[:]                                         # clear the contours list
+
+            for possibleChar in listOfPossibleCharsInPlate:
+                contours.append(possibleChar.contour)
+            # end for
+
+            # cv2.drawContours(imgContours, contours, -1, SCALAR_WHITE)
+
+            cv2.imshow("6", imgContours)
+
+        # given a list of all possible chars, find groups of matching chars within the plate
+        listOfListsOfMatchingCharsInPlate = findListOfListsOfMatchingChars(listOfPossibleCharsInPlate)
+
+        if show_steps == True: # show steps ###################################################
+            imgContours = np.zeros((height, width, 3), np.uint8)
+            del contours[:]
+
+            for listOfMatchingChars in listOfListsOfMatchingCharsInPlate:
+                intRandomBlue = random.randint(0, 255)
+                intRandomGreen = random.randint(0, 255)
+                intRandomRed = random.randint(0, 255)
+
+                for matchingChar in listOfMatchingChars:
+                    contours.append(matchingChar.contour)
+                # end for
+                cv2.drawContours(imgContours, contours, -1, (intRandomBlue, intRandomGreen, intRandomRed))
+            # end for
+            cv2.imshow("7", imgContours)
+        # end if # show steps #####################################################################
+
+        if (len(listOfListsOfMatchingCharsInPlate) == 0):			# if no groups of matching chars were found in the plate
+
+            if show_steps == True: # show steps ###############################################
+                print("chars found in plate number " + str(intPlateCounter) + " = (none), click on any image and press a key to continue . . .")
+                intPlateCounter = intPlateCounter + 1
+                cv2.destroyWindow("8")
+                cv2.destroyWindow("9")
+                cv2.destroyWindow("10")
+                cv2.waitKey(0)
+            # end if # show steps #################################################################
+
+            possiblePlate.strChars = ""
+            continue						# go back to top of for loop
+        # end if
+
+        for i in range(0, len(listOfListsOfMatchingCharsInPlate)):                              # within each list of matching chars
+            listOfListsOfMatchingCharsInPlate[i].sort(key = lambda matchingChar: matchingChar.intCenterX)        # sort chars from left to right
+            listOfListsOfMatchingCharsInPlate[i] = removeInnerOverlappingChars(listOfListsOfMatchingCharsInPlate[i])              # and remove inner overlapping chars
+        # end for
+
+        if show_steps == True: # show steps ###################################################
+            imgContours = np.zeros((height, width, 3), np.uint8)
+
+            for listOfMatchingChars in listOfListsOfMatchingCharsInPlate:
+                intRandomBlue = random.randint(0, 255)
+                intRandomGreen = random.randint(0, 255)
+                intRandomRed = random.randint(0, 255)
+
+                del contours[:]
+
+                for matchingChar in listOfMatchingChars:
+                    contours.append(matchingChar.contour)
+                # end for
+
+                cv2.drawContours(imgContours, contours, -1, (intRandomBlue, intRandomGreen, intRandomRed))
+            # end for
+            cv2.imshow("8", imgContours)
+        # end if # show steps #####################################################################
+
+                # within each possible plate, suppose the longest list of potential matching chars is the actual list of chars
+        intLenOfLongestListOfChars = 0
+        intIndexOfLongestListOfChars = 0
+
+                # loop through all the vectors of matching chars, get the index of the one with the most chars
+        for i in range(0, len(listOfListsOfMatchingCharsInPlate)):
+            if len(listOfListsOfMatchingCharsInPlate[i]) > intLenOfLongestListOfChars:
+                intLenOfLongestListOfChars = len(listOfListsOfMatchingCharsInPlate[i])
+                intIndexOfLongestListOfChars = i
+            # end if
+        # end for
+
+                # suppose that the longest list of matching chars within the plate is the actual list of chars
+        longestListOfMatchingCharsInPlate = listOfListsOfMatchingCharsInPlate[intIndexOfLongestListOfChars]
+
+        if show_steps == True: # show steps ###################################################
+            imgContours = np.zeros((height, width, 3), np.uint8)
+            del contours[:]
+
+            for matchingChar in longestListOfMatchingCharsInPlate:
+                contours.append(matchingChar.contour)
+            # end for
+
+            cv2.drawContours(imgContours, contours, -1, SCALAR_WHITE)
+
+            cv2.imshow("9", imgContours)
+        # end if # show steps #####################################################################
+
+        possiblePlate.strChars = recognizeCharsInPlate(possiblePlate.imgThresh, longestListOfMatchingCharsInPlate)
+
+        if show_steps == True: # show steps ###################################################
+            print("chars found in plate number " + str(intPlateCounter) + " = " + possiblePlate.strChars + ", click on any image and press a key to continue . . .")
+            intPlateCounter = intPlateCounter + 1
+            cv2.waitKey(0)
+        # end if # show steps #####################################################################
+
+    # end of big for loop that takes up most of the function
+
+    if show_steps == True:
+        print("\nchar detection complete, click on any image and press a key to continue . . .\n")
+        cv2.waitKey(0)
+    # end if
+
+    return listOfPossiblePlates
+
+
+def findPossibleCharsInPlate(imgGrayscale, imgThresh):
+    listOfPossibleChars = []                        # this will be the return value
+    contours = []
+    imgThreshCopy = imgThresh.copy()
+
+            # find all contours in plate
+    imgContours, contours, npaHierarchy = cv2.findContours(imgThreshCopy, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    for contour in contours:                        # for each contour
+        possibleChar = PossibleChar.PossibleChar(contour)
+
+        if checkIfPossibleChar(possibleChar):              # if contour is a possible char, note this does not compare to other chars (yet) . . .
+            listOfPossibleChars.append(possibleChar)       # add to list of possible chars
+        # end if
+    # end if
+
+    return listOfPossibleChars
+# end function
+
+###################################################################################################
+def checkIfPossibleChar(possibleChar):
+            # this function is a 'first pass' that does a rough check on a contour to see if it could be a char,
+            # note that we are not (yet) comparing the char to other chars to look for a group
+    if (possibleChar.intBoundingRectArea > MIN_PIXEL_AREA and
+        possibleChar.intBoundingRectWidth > MIN_PIXEL_WIDTH and possibleChar.intBoundingRectHeight > MIN_PIXEL_HEIGHT and
+        MIN_ASPECT_RATIO < possibleChar.fltAspectRatio and possibleChar.fltAspectRatio < MAX_ASPECT_RATIO):
+        return True
+    else:
+        return False
+    # end if
+# end function
+
+###################################################################################################
+def findListOfListsOfMatchingChars(listOfPossibleChars):
+            # with this function, we start off with all the possible chars in one big list
+            # the purpose of this function is to re-arrange the one big list of chars into a list of lists of matching chars,
+            # note that chars that are not found to be in a group of matches do not need to be considered further
+    listOfListsOfMatchingChars = []                  # this will be the return value
+
+    for possibleChar in listOfPossibleChars:                        # for each possible char in the one big list of chars
+        listOfMatchingChars = findListOfMatchingChars(possibleChar, listOfPossibleChars)        # find all chars in the big list that match the current char
+
+        listOfMatchingChars.append(possibleChar)                # also add the current char to current possible list of matching chars
+
+        if len(listOfMatchingChars) < MIN_NUMBER_OF_MATCHING_CHARS:     # if current possible list of matching chars is not long enough to constitute a possible plate
+            continue                            # jump back to the top of the for loop and try again with next char, note that it's not necessary
+                                                # to save the list in any way since it did not have enough chars to be a possible plate
+        # end if
+
+                                                # if we get here, the current list passed test as a "group" or "cluster" of matching chars
+        listOfListsOfMatchingChars.append(listOfMatchingChars)      # so add to our list of lists of matching chars
+
+        listOfPossibleCharsWithCurrentMatchesRemoved = []
+
+                                                # remove the current list of matching chars from the big list so we don't use those same chars twice,
+                                                # make sure to make a new big list for this since we don't want to change the original big list
+        listOfPossibleCharsWithCurrentMatchesRemoved = list(set(listOfPossibleChars) - set(listOfMatchingChars))
+
+        recursiveListOfListsOfMatchingChars = findListOfListsOfMatchingChars(listOfPossibleCharsWithCurrentMatchesRemoved)      # recursive call
+
+        for recursiveListOfMatchingChars in recursiveListOfListsOfMatchingChars:        # for each list of matching chars found by recursive call
+            listOfListsOfMatchingChars.append(recursiveListOfMatchingChars)             # add to our original list of lists of matching chars
+        # end for
+
+        break       # exit for
+
+    # end for
+
+    return listOfListsOfMatchingChars
+# end function
+
+###################################################################################################
+def findListOfMatchingChars(possibleChar, listOfChars):
+            # the purpose of this function is, given a possible char and a big list of possible chars,
+            # find all chars in the big list that are a match for the single possible char, and return those matching chars as a list
+    listOfMatchingChars = []                # this will be the return value
+
+    for possibleMatchingChar in listOfChars:                # for each char in big list
+        if possibleMatchingChar == possibleChar:    # if the char we attempting to find matches for is the exact same char as the char in the big list we are currently checking
+                                                    # then we should not include it in the list of matches b/c that would end up double including the current char
+            continue                                # so do not add to list of matches and jump back to top of for loop
+        # end if
+                    # compute stuff to see if chars are a match
+        fltDistanceBetweenChars = distanceBetweenChars(possibleChar, possibleMatchingChar)
+
+        fltAngleBetweenChars = angleBetweenChars(possibleChar, possibleMatchingChar)
+
+        fltChangeInArea = float(abs(possibleMatchingChar.intBoundingRectArea - possibleChar.intBoundingRectArea)) / float(possibleChar.intBoundingRectArea)
+
+        fltChangeInWidth = float(abs(possibleMatchingChar.intBoundingRectWidth - possibleChar.intBoundingRectWidth)) / float(possibleChar.intBoundingRectWidth)
+        fltChangeInHeight = float(abs(possibleMatchingChar.intBoundingRectHeight - possibleChar.intBoundingRectHeight)) / float(possibleChar.intBoundingRectHeight)
+
+                # check if chars match
+        if (fltDistanceBetweenChars < (possibleChar.fltDiagonalSize * MAX_DIAG_SIZE_MULTIPLE_AWAY) and
+            fltAngleBetweenChars < MAX_ANGLE_BETWEEN_CHARS and
+            fltChangeInArea < MAX_CHANGE_IN_AREA and
+            fltChangeInWidth < MAX_CHANGE_IN_WIDTH and
+            fltChangeInHeight < MAX_CHANGE_IN_HEIGHT):
+
+            listOfMatchingChars.append(possibleMatchingChar)        # if the chars are a match, add the current char to list of matching chars
+        # end if
+    # end for
+
+    return listOfMatchingChars                  # return result
+# end function
+
+###################################################################################################
+# use Pythagorean theorem to calculate distance between two chars
+def distanceBetweenChars(firstChar, secondChar):
+    intX = abs(firstChar.intCenterX - secondChar.intCenterX)
+    intY = abs(firstChar.intCenterY - secondChar.intCenterY)
+
+    return math.sqrt((intX ** 2) + (intY ** 2))
+# end function
+
+###################################################################################################
+# use basic trigonometry (SOH CAH TOA) to calculate angle between chars
+def angleBetweenChars(firstChar, secondChar):
+    fltAdj = float(abs(firstChar.intCenterX - secondChar.intCenterX))
+    fltOpp = float(abs(firstChar.intCenterY - secondChar.intCenterY))
+
+    if fltAdj != 0.0:                           # check to make sure we do not divide by zero if the center X positions are equal, float division by zero will cause a crash in Python
+        fltAngleInRad = math.atan(fltOpp / fltAdj)      # if adjacent is not zero, calculate angle
+    else:
+        fltAngleInRad = 1.5708                          # if adjacent is zero, use this as the angle, this is to be consistent with the C++ version of this program
+    # end if
+
+    fltAngleInDeg = fltAngleInRad * (180.0 / math.pi)       # calculate angle in degrees
+
+    return fltAngleInDeg
+# end function
+
+###################################################################################################
+# if we have two chars overlapping or to close to each other to possibly be separate chars, remove the inner (smaller) char,
+# this is to prevent including the same char twice if two contours are found for the same char,
+# for example for the letter 'O' both the inner ring and the outer ring may be found as contours, but we should only include the char once
+def removeInnerOverlappingChars(listOfMatchingChars):
+    listOfMatchingCharsWithInnerCharRemoved = list(listOfMatchingChars)                # this will be the return value
+
+    for currentChar in listOfMatchingChars:
+        for otherChar in listOfMatchingChars:
+            if currentChar != otherChar:        # if current char and other char are not the same char . . .
+                                                                            # if current char and other char have center points at almost the same location . . .
+                if distanceBetweenChars(currentChar, otherChar) < (currentChar.fltDiagonalSize * MIN_DIAG_SIZE_MULTIPLE_AWAY):
+                                # if we get in here we have found overlapping chars
+                                # next we identify which char is smaller, then if that char was not already removed on a previous pass, remove it
+                    if currentChar.intBoundingRectArea < otherChar.intBoundingRectArea:         # if current char is smaller than other char
+                        if currentChar in listOfMatchingCharsWithInnerCharRemoved:              # if current char was not already removed on a previous pass . . .
+                            listOfMatchingCharsWithInnerCharRemoved.remove(currentChar)         # then remove current char
+                        # end if
+                    else:                                                                       # else if other char is smaller than current char
+                        if otherChar in listOfMatchingCharsWithInnerCharRemoved:                # if other char was not already removed on a previous pass . . .
+                            listOfMatchingCharsWithInnerCharRemoved.remove(otherChar)           # then remove other char
+                        # end if
+                    # end if
+                # end if
+            # end if
+        # end for
+    # end for
+
+    return listOfMatchingCharsWithInnerCharRemoved
+
+
+# this is where we apply the actual char recognition
+def recognizeCharsInPlate(imgThresh, listOfMatchingChars):
+    # this will be the return value, the chars in the lic plate
+    strChars = ""
+
+    height, width = imgThresh.shape
+
+    imgThreshColor = np.zeros((height, width, 3), np.uint8)
+
+    listOfMatchingChars.sort(key=lambda matchingChar: matchingChar.intCenterX)        # sort chars from left to right
+
+    cv2.cvtColor(imgThresh, cv2.COLOR_GRAY2BGR, imgThreshColor)                     # make color version of threshold image so we can draw contours in color on it
+
+    for currentChar in listOfMatchingChars:                                         # for each char in plate
+        pt1 = (currentChar.intBoundingRectX, currentChar.intBoundingRectY)
+        pt2 = ((currentChar.intBoundingRectX + currentChar.intBoundingRectWidth), (currentChar.intBoundingRectY + currentChar.intBoundingRectHeight))
+
+        # draw green box around the char
+        cv2.rectangle(imgThreshColor, pt1, pt2, SCALAR_GREEN, 2)
+
+        # crop char out of threshold image
+        imgROI = imgThresh[currentChar.intBoundingRectY: currentChar.intBoundingRectY + currentChar.intBoundingRectHeight,
+                           currentChar.intBoundingRectX: currentChar.intBoundingRectX + currentChar.intBoundingRectWidth]
+
+        imgROIResized = cv2.resize(imgROI, (RESIZED_CHAR_IMAGE_WIDTH, RESIZED_CHAR_IMAGE_HEIGHT))           # resize image, this is necessary for char recognition
+
+        npaROIResized = imgROIResized.reshape((1, RESIZED_CHAR_IMAGE_WIDTH * RESIZED_CHAR_IMAGE_HEIGHT))        # flatten image into 1d numpy array
+
+        npaROIResized = np.float32(npaROIResized)               # convert from 1d numpy array of ints to 1d numpy array of floats
+
+        retval, npaResults, neigh_resp, dists = kNearest.findNearest(npaROIResized, k = 1)              # finally we can call findNearest !!!
+
+        strCurrentChar = str(chr(int(npaResults[0][0])))            # get character from results
+
+        strChars = strChars + strCurrentChar                        # append current char to full string
+
+    if show_steps:
+        cv2.imshow("10", imgThreshColor)
+
+    return strChars
+======================
+
+
+======================
+/license_plate_recognition/find_counters.py
+import cv2
+import numpy as np
+import os
+from next.next import BASE_DIR
+
+img = cv2.imread(os.path.join(BASE_DIR, "license_plate_recognition", "imgOriginalScene.png"))
+cv2.imshow('Image', img)
+
+#--- create a blank image of the same size for storing the green rectangles (boundaries) ---
+black = np.zeros_like(img)
+
+#--- convert your image to grayscale and apply a threshold ---
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+ret2, th2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+#--- perform morphological operation to ensure smaller portions are part of a single character ---
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+threshed = cv2.morphologyEx(th2, cv2.MORPH_CLOSE, kernel)
+
+#--- find contours ---
+imgContours, Contours, Hierarchy = cv2.findContours(threshed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+for contour in Contours:
+
+    #--- select contours above a certain area ---
+    if cv2.contourArea(contour) > 200:
+
+        #--- store the coordinates of the bounding boxes ---
+        [X, Y, W, H] = cv2.boundingRect(contour)
+
+        #--- draw those bounding boxes in the actual image as well as the plain blank image ---
+        cv2.rectangle(img, (X, Y), (X + W, Y + H), (0,0,255), 2)
+        cv2.rectangle(black, (X, Y), (X + W, Y + H), (0,255,0), 2)
+
+cv2.imshow('contour', img)
+cv2.imshow('black', black)
+input()======================
+
+
+======================
+/license_plate_recognition/PossibleChar.py
+import cv2
+import math
+
+
+class PossibleChar:
+
+    def __init__(self, _contour):
+        self.contour = _contour
+
+        self.boundingRect = cv2.boundingRect(self.contour)
+
+        [intX, intY, intWidth, intHeight] = self.boundingRect
+
+        self.intBoundingRectX = intX
+        self.intBoundingRectY = intY
+        self.intBoundingRectWidth = intWidth
+        self.intBoundingRectHeight = intHeight
+
+        self.intBoundingRectArea = self.intBoundingRectWidth * self.intBoundingRectHeight
+
+        self.intCenterX = (self.intBoundingRectX + self.intBoundingRectX + self.intBoundingRectWidth) / 2
+        self.intCenterY = (self.intBoundingRectY + self.intBoundingRectY + self.intBoundingRectHeight) / 2
+
+        self.fltDiagonalSize = math.sqrt((self.intBoundingRectWidth ** 2) + (self.intBoundingRectHeight ** 2))
+
+        self.fltAspectRatio = float(self.intBoundingRectWidth) / float(self.intBoundingRectHeight)
+
+
+
+
+
+
+
+
+
+======================
+
+
+======================
+/license_plate_recognition/main.py
+import os
+import cv2
+from next.next import RESOURCES_DIR
+from license_plate_recognition.params import *
+from license_plate_recognition import DetectChars
+from license_plate_recognition import DetectPlates
+
+
+def recognize(image_name):
+    source_image = cv2.imread(os.path.join(RESOURCES_DIR, "repository", "images", image_name))
+
+    # attempt KNN training
+    if not DetectChars.loadKNNDataAndTrainKNN():
+        print("\nerror: KNN traning was not successful\n")
+        return
+
+    if source_image is None:
+        print("\nerror: image not read from file \n\n")
+        return
+
+    # detect plates
+    listOfPossiblePlates = DetectPlates.detectPlatesInScene(source_image)
+
+    # detect chars in plates
+    listOfPossiblePlates = DetectChars.detectCharsInPlates(listOfPossiblePlates)
+
+    # show scene image
+    cv2.imshow("imgOriginalScene", source_image)
+
+    # if places weren't found
+    if len(listOfPossiblePlates) == 0:
+        print("no license plates were detected")
+        return
+
+    # sort the list of possible plates in DESCENDING order (most number of chars to least number of chars)
+    listOfPossiblePlates.sort(key=lambda possiblePlate: len(possiblePlate.strChars), reverse=True)
+
+    # suppose the plate with the most recognized chars
+    # (the first plate in sorted by string length descending order) is the actual plate
+    licPlate = listOfPossiblePlates[0]
+
+    # show crop of plate and threshold of plate
+    # cv2.imshow("imgPlate", licPlate.imgPlate)
+    cv2.imshow("imgThresh", licPlate.imgThresh)
+    cv2.imwrite("imgOriginalScene.png", licPlate.imgThresh)
+
+    # if no chars were found in the plate
+    if len(licPlate.strChars) == 0:
+        print("No characters were detected")
+        return
+
+    # draw red rectangle around plate
+    draw_red_rectangle_around_plate(source_image, licPlate)
+    # --------------------------------------------------------------------
+    # write license plate text
+    print("license plate read from image = " + licPlate.strChars)
+    # --------------------------------------------------------------------
+
+    # write license plate text on the image
+    # writeLicensePlateCharsOnImage(imgOriginalScene, licPlate)
+
+    # re-show scene image
+    # cv2.imshow("imgOriginalScene", imgOriginalScene)
+
+    # write image out to file
+    # cv2.imwrite("imgOriginalScene.png", imgOriginalScene)
+
+    # hold windows open until user presses a key
+    cv2.waitKey(0)
+
+
+def draw_red_rectangle_around_plate(img_original_scene, lic_plate):
+    # get 4 vertices of rotated rect
+    p2fRectPoints = cv2.boxPoints(lic_plate.rrLocationOfPlateInScene)
+    # draw 4 red lines
+    cv2.line(img_original_scene, tuple(p2fRectPoints[0]), tuple(p2fRectPoints[1]), SCALAR_RED, 2)
+    cv2.line(img_original_scene, tuple(p2fRectPoints[1]), tuple(p2fRectPoints[2]), SCALAR_RED, 2)
+    cv2.line(img_original_scene, tuple(p2fRectPoints[2]), tuple(p2fRectPoints[3]), SCALAR_RED, 2)
+    cv2.line(img_original_scene, tuple(p2fRectPoints[3]), tuple(p2fRectPoints[0]), SCALAR_RED, 2)
+
+
+def writeLicensePlateCharsOnImage(imgOriginalScene, licPlate):
+    # this will be the center of the area the text will be written to
+    ptCenterOfTextAreaX = 0
+    ptCenterOfTextAreaY = 0
+
+    # this will be the bottom left of the area that the text will be written to
+    ptLowerLeftTextOriginX = 0
+    ptLowerLeftTextOriginY = 0
+
+    sceneHeight, sceneWidth, sceneNumChannels = imgOriginalScene.shape
+    plateHeight, plateWidth, plateNumChannels = licPlate.imgPlate.shape
+
+    intFontFace = cv2.FONT_HERSHEY_SIMPLEX                      # choose a plain jane font
+    fltFontScale = float(plateHeight) / 30.0                    # base font scale on height of plate area
+    intFontThickness = int(round(fltFontScale * 1.5))           # base font thickness on font scale
+
+    # call getTextSize
+    textSize, baseline = cv2.getTextSize(licPlate.strChars, intFontFace, fltFontScale, intFontThickness)
+
+    # unpack roatated rect into center point, width and height, and angle
+    ((intPlateCenterX, intPlateCenterY), (intPlateWidth, intPlateHeight), fltCorrectionAngleInDeg ) = \
+        licPlate.rrLocationOfPlateInScene
+
+    # make sure center is an integer
+    intPlateCenterX = int(intPlateCenterX)
+    intPlateCenterY = int(intPlateCenterY)
+
+    # the horizontal location of the text area is the same as the plate
+    ptCenterOfTextAreaX = int(intPlateCenterX)
+
+    # if the license plate is in the upper 3/4 of the image
+    if intPlateCenterY < (sceneHeight * 0.75):
+        # write the chars in below the plate
+        ptCenterOfTextAreaY = int(round(intPlateCenterY)) + int(round(plateHeight * 1.6))
+    # else if the license plate is in the lower 1/4 of the image
+    else:
+        # write the chars in above the plate
+        ptCenterOfTextAreaY = int(round(intPlateCenterY)) - int(round(plateHeight * 1.6))
+
+    # unpack text size width and height
+    textSizeWidth, textSizeHeight = textSize
+
+    # calculate the lower left origin of the text area
+    ptLowerLeftTextOriginX = int(ptCenterOfTextAreaX - (textSizeWidth / 2))
+    # based on the text area center, width, and height
+    ptLowerLeftTextOriginY = int(ptCenterOfTextAreaY + (textSizeHeight / 2))
+
+    # write the text on the image
+    cv2.putText(
+        imgOriginalScene,
+        licPlate.strChars,
+        (ptLowerLeftTextOriginX, ptLowerLeftTextOriginY),
+        intFontFace,
+        fltFontScale,
+        SCALAR_YELLOW,
+        intFontThickness
+    )
+
+
+# recognize("a707bt.jpg")
+# recognize("k834ot.jpg")
+recognize("m506kk.jpg")
+# recognize("a001aa.jpg")
+# recognize("b077bb.jpg")
+# recognize("b666ko.jpg")
+# recognize("pny_exps.png")
+# recognize("z00mn65.png")
+# recognize("1zm961.png")
+======================
+
+
+======================
+/license_plate_recognition/lpc.py
+
+class LPC(object):
+
+    def detect_places(self, image_path):
+        pass
+======================
+
+
+======================
+/applications/perseptron/even_or_not_even_numbers.py
+import os
+from next.next import RESOURCES_DIR
+from util.parser import NumberParser
+from util.easyTables import EasyTables
+from entities.perceptron import Perceptron
+from util.folder_scaner import folder_scan
+from store.impl.perceptron_mock_store import PerseptronMockStoreService
+
+template_folder = os.path.join(RESOURCES_DIR, "digit_templates")
+# инициализируем персептрон для проверки четности числа
+perceptron = Perceptron(name="even", number_of_input=66, store_service=PerseptronMockStoreService())
+
+# получаем список всех файлов в папке шаблонов
+list_of_numbers = folder_scan(template_folder)
+
+# словарь соответствия буквенных названий цифр и числовых
+numbers = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+           "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+# генерируем словарь с именами шаблонов и массивом данных
+templates = {}
+for template_name in list_of_numbers:
+    resources = NumberParser.parse("{}/{}".format(template_folder, template_name))
+    templates[numbers[template_name]] = resources[0]
+
+# для сортировки результата работы в таблице (чтобы числа шли от меньшего к большему)
+# отсортируем ключи в словаре шаблонов
+keys = []
+for key in templates:
+    keys.append(key)
+keys.sort()
+
+# обучение нейрона. Если число четное, ожидаем единицу, иначе 0
+learn_complete = False
+while not learn_complete:
+    learn_complete = True
+    for number in keys:
+        expect_result = 1 if number % 2 == 0 else 0
+        learn_result = perceptron.learning(templates[number], expect_result)
+        if not learn_result:
+            learn_complete = False
+
+table = EasyTables(["Число", "Четное? (да/нет)", "Результат"])
+for number in keys:
+    result = perceptron.calculate(templates[number])
+    answer = "да" if result > 0.9 else "нет"
+    table.add_row([number, answer, result])
+table.display()
+======================
+
+
+======================
+/applications/perseptron/and_or_binarry_operations.py
+from entities.perceptron import Perceptron
+from store.impl.perceptron_mock_store import PerseptronMockStoreService
+
+# Обучение нейрона вычислению бинарной операции ИЛИ. Число входов = 2
+
+neuron = Perceptron(name="OR_2INPUT", number_of_input=2, auto_save=True, store_service=PerseptronMockStoreService())
+
+neuron.learning([0, 0], 0, display=True)
+neuron.learning([0, 1], 1, display=True)
+neuron.learning([1, 0], 1, display=True)
+neuron.learning([1, 1], 1, display=True)
+
+print("0 OR 0 = {}".format(neuron.calculate([0, 0])))
+print("0 OR 1 = {}".format(neuron.calculate([0, 1])))
+print("1 OR 0 = {}".format(neuron.calculate([1, 0])))
+print("1 OR 1 = {}".format(neuron.calculate([1, 1])))
+
+# Обучение нейрона вычислению бинарной операции И. Число входов = 3
+neuron = Perceptron(name="AND_3INPUT", number_of_input=3, auto_save=True, store_service=PerseptronMockStoreService())
+
+neuron.learning([0, 0, 0], 0, display=True)
+neuron.learning([1, 1, 1], 1, display=True)
+neuron.learning([1, 0, 1], 0, display=True)
+neuron.learning([0, 1, 0], 0, display=True)
+neuron.learning([0, 1, 1], 0, display=True)
+
+print("1 AND 1 AND 1 = {}".format(neuron.calculate([1, 1, 1])))
+print("0 AND 0 AND 0 = {}".format(neuron.calculate([0, 0, 0])))
+print("0 AND 1 AND 0 = {}".format(neuron.calculate([0, 1, 0])))
+print("1 AND 0 AND 1 = {}".format(neuron.calculate([1, 0, 1])))
+print("0 AND 1 AND 1 = {}".format(neuron.calculate([0, 1, 1])))
+print("0 AND 1 AND 0 = {}".format(neuron.calculate([0, 1, 0])))
+
+
+# Обучение нейрона вычислению бинарной операции ИЛИ. Число входов = 4
+neuron = Perceptron(name="OR_4INPUT", number_of_input=4, auto_save=True, store_service=PerseptronMockStoreService())
+neuron.learning([0, 0, 0, 0], 0, display=True)
+neuron.learning([1, 0, 1, 0], 1, display=True)
+neuron.learning([0, 1, 0, 1], 1, display=True)
+neuron.learning([1, 1, 1, 0], 1, display=True)
+neuron.learning([0, 1, 0, 0], 1, display=True)
+neuron.learning([0, 1, 1, 1], 1, display=True)
+
+print("0 OR 0 OR 0 OR 0 = {}".format(neuron.calculate([0, 0, 0, 0])))
+print("0 OR 1 OR 0 OR 1 = {}".format(neuron.calculate([0, 1, 0, 1])))
+print("1 OR 0 OR 1 OR 0 = {}".format(neuron.calculate([1, 0, 1, 0])))
+print("1 OR 1 OR 1 OR 0 = {}".format(neuron.calculate([1, 1, 1, 0])))
+print("0 OR 1 OR 1 OR 1 = {}".format(neuron.calculate([0, 1, 1, 1])))
+print("0 OR 1 OR 0 OR 0 = {}".format(neuron.calculate([0, 1, 0, 0])))
+
+
+# # Обучение нейрона вычислению бинарной операции И. Число входов = 4
+neuron = Perceptron(name="AND_4INPUT", number_of_input=4, auto_save=True, store_service=PerseptronMockStoreService())
+neuron.learning([0, 0, 0, 0], 0, display=True)
+neuron.learning([0, 1, 0, 1], 0, display=True)
+neuron.learning([1, 0, 1, 0], 0, display=True)
+neuron.learning([1, 1, 1, 0], 0, display=True)
+neuron.learning([0, 1, 1, 1], 0, display=True)
+neuron.learning([1, 1, 1, 1], 1, display=True)
+
+print("1 AND 1 AND 1 AND 1 = {}".format(neuron.calculate([1, 1, 1, 1])))
+print("0 AND 1 AND 1 AND 1 = {}".format(neuron.calculate([0, 1, 1, 1])))
+print("0 AND 0 AND 0 AND 0 = {}".format(neuron.calculate([0, 0, 0, 0])))
+print("0 AND 1 AND 0 AND 1 = {}".format(neuron.calculate([0, 1, 0, 1])))
+print("1 AND 0 AND 1 AND 0 = {}".format(neuron.calculate([1, 0, 1, 0])))
+print("1 AND 1 AND 1 AND 0 = {}".format(neuron.calculate([1, 1, 1, 0])))
+print("0 AND 1 AND 0 AND 0 = {}".format(neuron.calculate([0, 1, 0, 0])))
+
+
+# Обучение нейрона вычислению бинарной операции ИЛИ. Число входов = 5
+neuron = Perceptron(name="OR_5_INPUT", number_of_input=5, auto_save=True, store_service=PerseptronMockStoreService())
+neuron.learning([0, 0, 0, 0, 0], 0, display=True)
+neuron.learning([0, 0, 1, 0, 0], 1, display=True)
+neuron.learning([1, 0, 0, 0, 0], 1, display=True)
+neuron.learning([0, 0, 0, 0, 1], 1, display=True)
+neuron.learning([1, 0, 1, 0, 1], 1, display=True)
+neuron.learning([1, 1, 1, 0, 1], 1, display=True)
+neuron.learning([0, 1, 0, 0, 0], 1, display=True)
+neuron.learning([0, 1, 1, 1, 0], 1, display=True)
+
+print("0 OR 0 OR 0 OR 0 OR 0 = {}".format(neuron.calculate([0, 0, 0, 0, 0])))
+print("1 OR 0 OR 0 OR 0 OR 0 = {}".format(neuron.calculate([1, 0, 0, 0, 0])))
+print("0 OR 0 OR 1 OR 0 OR 0 = {}".format(neuron.calculate([0, 0, 1, 0, 0])))
+print("0 OR 0 OR 0 OR 0 OR 1 = {}".format(neuron.calculate([0, 0, 0, 0, 1])))
+print("0 OR 1 OR 0 OR 1 OR 0 = {}".format(neuron.calculate([0, 1, 0, 1, 0])))
+print("1 OR 0 OR 1 OR 0 OR 1 = {}".format(neuron.calculate([1, 0, 1, 0, 1])))
+print("1 OR 1 OR 1 OR 0 OR 0 = {}".format(neuron.calculate([1, 1, 1, 0, 0])))
+print("0 OR 1 OR 1 OR 1 OR 1 = {}".format(neuron.calculate([0, 1, 1, 1, 1])))
+print("0 OR 1 OR 0 OR 0 OR 1 = {}".format(neuron.calculate([0, 1, 0, 0, 1])))
+print("1 OR 1 OR 1 OR 1 OR 1 = {}".format(neuron.calculate([1, 1, 1, 1, 1])))
+======================
+
+
+======================
+/applications/test_drive_ART_network.py
+"""
+Проверка работы сети адаптивно резонансной теории
+"""
+import os
+from PIL import Image
+from entities.ART.network import Network
+from util import folder_scaner
+from next.next import BASE_DIR
+
+def parse_image(src):
+    """
+    Функция представления изображения в формате bmp в виде
+    массива нулей и единиц (0 - черный цвет, 1 - белый)
+    :param src: путь к файлу bmp
+    :return: list 
+    """
+    img = Image.open(src)
+    pixels = img.load()
+    data = []
+    for i in range(img.size[0]):
+        for j in range(img.size[1]):
+            value = 1 if pixels[i, j] == 255 else 0
+            data.append(value)
+    img.close()
+    return data
+
+
+def list_to_image(array):
+    """
+    Функция для представления списка нулей и единиц в виде bmp изображения.
+    :param array: список нулей и единиц
+    :return: 
+    """
+    img = Image.new('1', (100, 100))
+    pixels = img.load()
+    for i in range(img.size[0]):
+        for j in range(img.size[1]):
+            pixels[i, j] = array.pop(0)
+    img.show()
+
+# папка с образами
+image_folder = os.path.join(BASE_DIR, "number_images")
+# список образов в папке
+templates = folder_scaner.folder_scan(image_folder)
+
+# объект сети АРТ. Каждое изображение имеет разрешение 100x100, поэтому число входов = 10000
+network = Network(name="IMAGE_NUMBERS", number_of_input=10000, auto_save=False)
+
+
+print("----------------- {} -----------------".format("Фаза обучения"))
+
+for template in templates:
+    # в цикле проходим по всем образам и подаем их на вход сети
+    image = image_folder + template
+    print("template: ", template)
+    out = network.recognize(parse_image(image))
+    print()
+
+print("----------------- {} -----------------".format("Фаза тестирования"))
+
+image_folder = os.path.join(BASE_DIR, "number_images")
+templates = folder_scaner.folder_scan(image_folder)
+for template in templates:
+    image = image_folder + template
+    print("test template: ", template)
+    copy = parse_image(image)
+    data = parse_image(image)
+    response = network.recognize(data)
+    print()
+    list_to_image(response)
+======================
+
+
+======================
+/applications/bp_images_demo.py
+
+"""
+            #####                   BACKPROPAGATION                 #####
+            #####   АЛГОРИТМ ОБУЧЕНИЯ МНОГОСЛОЙНОЙ НЕЙРОННОЙ СЕТИ   #####
+            #####   МЕТОДОМ ОБРАТНОГО РАСПРОСТРАНЕНИЯ ОШИБКИ        #####
+
+Данный тест работает с изображениями в формате BMP. Тест состоит из четырех фаз:
+        * инициализация сети
+        * обучение сети
+        * распознавание изображений
+        * анализ эффективности работы
+Сначала создается сеть с определенным количеством слоев и нейронов в каждом слое. Затем идет обучение сети.
+
+В папке с шаблонами (TEMPLATE_FOLDER) необходимо создать подкаталоги, каждый каталог - отдельная группа образов,
+имя каталога - имя группы. В эти подкаталогах может находится n образов. Число нейронов во внешнем слое
+определяется числом каталогов (групп) в папке с шаблонами. Ожидаемый отклик сети формируется автоматически.
+Полученный списко групп образов сортируется по алфавиту и в ожидаемом отклике сети для i-ой группы i-ый
+элемент массива равен 1, остальные. Далее сканируются все подкаталоги и формируется список образов (images)
+в формате [бинарное представление, имя_группы]. Затем в цикле в случайном порядке выбирается образ и выполняется
+процесс обучения сети. Процесс повторяется пока все образы не будут выбраны и сеть не обучиться.
+
+В фазе распознавания сканируется каталог folder_for_scan и преобразованные в списки изображения подаются на
+вход сети для распознавания. По окончании выводится таблица содержащая названием группы, к которой сеть
+сопоставила конкретное изображение.
+
+На этапе анализа эффективности работы на каждый образ накладывается шум (случайно инвертируем n бит
+в последовательности), процентное соотношение между шумом и полезными данными задается параметром percent_of_noise.
+Далее на вход сети подается зашумленное изображение и сравнивается группа, к которой сети отнесла данный образс той,
+что указана в начале файла. В начале имени файла должно содержаться одно из имен групп, которым ранее сеть была
+обучена. Пример  seven_824_23v2.bmp (относится к группе seven), car_audiA8.bmp (относится к группе car)
+"""
+import os
+import re
+import time
+import logging
+from random import randint
+from datetime import datetime
+from util.bmp import bmp_to_binary
+from util.easyTables import EasyTables
+from util.folder_scaner import folder_scan
+from store.service.store_service import StoreService
+from next.next import RESOURCES_DIR, Next
+from util.network_aggregation import create_net_from_json
+
+# Init configuration
+Next.get_instance(config_path=os.path.join(RESOURCES_DIR, "applications", "bp_images_demo_descriptor.yml"),
+                  external_check=False)
+
+logger = logging.getLogger(__name__)
+
+# запрос на очищение хранилища перед обучением
+delete = input("Clean Store? [N/y]: ").lower()
+store = StoreService()
+if delete == 'y':
+    logger.info("Cleaning store...")
+    store.clean()
+
+# learn определяет, нужно ли проводить процесс обучения
+confirm = input("Learn? [N/y]: ").lower()
+learn = True if confirm == "y" else False
+
+# словарь, хранящий объект сети и служебную информацию
+net = create_net_from_json(os.path.join(RESOURCES_DIR, "topologies", "bp_test_topology.json"))
+# объект сети
+network = net.get("object")
+# размер входной последовательности
+len_image = network.get_input_size()
+# имя нейронной сети. Участвует в формировании имен слоев.
+# Формат: "символьное_имя[N1-N2-N3-...-Nm]", где Ni - число нейронов в i слое
+NETWORK_NAME = net.get("name")
+# папка с образами для обучения. Путь относительно текущей директории
+TEMPLATE_FOLDER = net.get("payload").get("template_folder")
+# папка с образами для фазы распознавания
+RECOGNIZE_FOLDER = net.get("payload").get("recognize_folder")
+# получаем список всех групп образов для обучения - список папок с группами
+group_list = folder_scan(os.path.join(RESOURCES_DIR, TEMPLATE_FOLDER))
+# сортируем для дальнейшего маппинга номера выходного нейрона с именем группы
+group_list.sort()
+
+# Для задания числа входных сигналов сети возьмем длину любого шаблона из списка
+# Далее проверка наличия шаблонов в папке TEMPLATE_FOLDER
+for folder in group_list:
+    if not folder_scan(os.path.join(RESOURCES_DIR, TEMPLATE_FOLDER, folder)):
+        msg = "Group %s is empty!" % folder
+        logger.error(msg)
+        raise RuntimeError(msg)
+
+
+# словарь соответсвтвия. Ключ - имя группы, значение - номер нейрона на выходе сети
+group_identify = {}
+table = EasyTables(["Group name", "Index of out network"])
+logger.debug("Generate mapping...")
+for i in range(len(group_list)):
+    group_identify[group_list[i]] = i
+    table.add_row([group_list[i], i])
+    logger.info("Mapping. group: %s index:\t%d" % (group_list[i], i))
+table.display()
+
+if learn:
+    logger.info("Start learning...")
+    start_time = time.time()
+    # список образов - [бинарное предстваление образа, имя группы]
+    images = []
+    # словарь соответствия группы образов и выхода сети
+    expect = {}
+    for i in range(len(group_list)):
+        expect[group_list[i]] = [1 if i == _ else 0 for _ in range(len(group_list))]
+
+        template_group = group_list[i]
+        for template in folder_scan(os.path.join(RESOURCES_DIR, TEMPLATE_FOLDER, template_group)):
+            binary_image = bmp_to_binary(os.path.join(RESOURCES_DIR, TEMPLATE_FOLDER, template_group, template))
+            images.append([binary_image, template_group])
+
+    count_epoch = 0
+    complete_learn = False
+    while not complete_learn:
+        complete_learn = True
+        # хранит рание выбранные образы
+        memory = set()
+        while len(memory) < len(images):
+            # индекс следующего образа в images
+            next_image = randint(0, len(images)-1)
+            if next_image not in memory:
+                memory.add(next_image)
+                source = images[next_image]
+                if not network.learn(source[0], expect[source[1]]):
+                    complete_learn = False
+
+        count_epoch += 1
+        # каждые n чиклов выводим пргресс обучения
+        if count_epoch % 1 == 0:
+            table = EasyTables(["Group", "Correct response", "Index", "Full response"])
+            for group in group_list:
+                for image in images:
+                    if image[1] == group:
+                        response = list(map(lambda x: round(x, 3), network.calculate(image[0])))
+                        correct_out = group_identify[image[1]]
+                        table.add_row([group, response[correct_out], correct_out, response])
+            table.display()
+            print("Learn process. Network name: %s" % NETWORK_NAME)
+            print("Count epoch: %d " % count_epoch)
+            print("learn temp: %d" % network.get_learn_rate())
+            print("Spent time: %s min" % round((time.time() - start_time)/60), 2)
+
+        if count_epoch % 5 == 0:
+            start = time.time()
+            print("Save state of network {} ({})".format(NETWORK_NAME, datetime.now()))
+            network.save_state()
+            print("OK! {} sec".format(round(time.time()-start, 2)))
+
+    print("COUNT EPOCH: {}".format(count_epoch))
+    print("Spent time: {} sec ({} min)".format(time.time() - start_time, round((time.time() - start_time) / 60), 2))
+    print("Save state of network {} ({})".format(NETWORK_NAME, datetime.now()))
+    network.save_state()
+
+
+# """*************************** ФАЗА РАСПОЗНАВАНИЯ ***************************"""
+print("Recognize images...")
+title = ["File name", "Prediction", "Full response"]
+table = EasyTables(title)
+for template in folder_scan(os.path.join(RESOURCES_DIR, RECOGNIZE_FOLDER)):
+    bin_image = bmp_to_binary(os.path.join(RESOURCES_DIR, RECOGNIZE_FOLDER, template))
+    # округление результов распознования
+    response = list(map(lambda x: round(x, 3), network.calculate(bin_image)))
+    winner_index = response.index(max(response))
+    row = [template]
+    # поиск группы по индексу максимального выхода сети
+    for key in group_identify:
+        if group_identify[key] == winner_index:
+            row.append(key)
+            break
+    row.append(response)
+    table.add_row(row)
+table.display()
+
+"""********************** АНАЛИЗ ЭФФЕКТИВНОСТИ РАБОТЫ **********************"""
+# процент зашумления изображения
+percent_of_noise = 15
+# шаблон поиска имени группы в начале файла
+pattern = r"^[a-zA-Z]+"
+# список образов в каталоге
+image_list = folder_scan(os.path.join(RESOURCES_DIR, RECOGNIZE_FOLDER))
+image_list.sort()
+
+
+# словарь образов. Ключ - имя файла, значение - список
+# [бинарное представление, имя_группы]
+images = {}
+for image in image_list:
+    file_name = re.match(pattern, image)
+    if file_name:
+        images[image] = [bmp_to_binary(os.path.join(RESOURCES_DIR, RECOGNIZE_FOLDER, image)), file_name.group(0)]
+    else:
+        print("File: <{}>. No matching group found.".format(image))
+
+
+for noise_level in range(20, 103, 3):
+    percent_of_noise = noise_level
+    # общее число ошибок распознавания
+    count_error = 0
+    # число уже обработанных вариантов
+    processed_images = 0
+    start_time = time.time()
+    while processed_images < 10000:
+        for image in images:
+            processed_images += 1
+            cp = images[image][0].copy()
+
+            noise = set()
+            while len(noise) < int(len_image*percent_of_noise/100):
+                noise.add(randint(0, len_image-1))
+
+            for i in noise:
+                cp[i] = 0 if cp[i] else 1
+            prediction = network.calculate(cp)
+            winner_index = prediction.index(max(prediction))
+            group = None
+            for key in group_identify:
+                if group_identify[key] == winner_index:
+                    group = key
+                    break
+
+            if group != images[image][1]:
+                    count_error += 1
+            if processed_images % 100 == 0:
+                print("Network name: ", NETWORK_NAME)
+                print("Noise level: {}%".format(percent_of_noise))
+                print("Remaining {}% ({} images pass)".format(100-processed_images/10000*100, processed_images))
+                print("Count of errors -  {}".format(count_error))
+                print("Precision {}%".format(round((1-count_error/processed_images)*100, 2)))
+                print("time: {} min".format(round((time.time() - start_time)/60, 2)))
+                print()
+# print("------------------------------")
+# print("Network name: ", NETWORK_NAME)
+# print("Noise level: {}%".format(percent_of_noise))
+# print("Count of errors -  {}".format(count_error))
+# print("Count of template", processed_images)
+# print("Precision: {}%".format(round((1 - count_error/processed_images)*100, 3)))
+======================
+
+
+======================
+/applications/test_drive_backpropagation.py
+import os
+from util.parser import NumberParser
+from util.folder_scaner import folder_scan
+from entities.backpropagation.layer import Layer
+from entities.backpropagation.network import Network
+from next.next import RESOURCES_DIR, set_option
+from store.impl.perceptron_mock_store import PerseptronMockStoreService
+
+"""
+            #####                   BACKPROPAGATION                 #####
+            #####   АЛГОРИТМ ОБУЧЕНИЯ МНОГОСЛОЙНОЙ НЕЙРОННОЙ СЕТИ   #####
+            #####   МЕТОДОМ ОБРАТНОГО РАСПРОСТРАНЕНИЯ ОШИБКИ        #####
+
+    Суть данного теста в следующем. Необходимо создать несколько слое, затем связать их в сеть.
+    Провести процедуру обучения на всех имеющихся образах (шаблоны чисел в папке TEMPLATE_FOLDER)
+    и затем, изменяя входные данные (внося исправления в шаблоны из папки TEMPLATE_FOLDER),
+    наблюдать за вычислением сети.
+    Шаблоны сканируются автоматически. Список ожидаемого отклика формируется следующим образом:
+    для i-ого шаблона i-ый элемент в списке выставляется равным единице, остальные нулю.
+"""
+
+set_option("base_neuron_store", PerseptronMockStoreService())
+
+# имя нейронной сети. Участвует в формировании имен слоев
+NETWORK_NAME = "template_number"
+# папка с образами для обучения. Путь относительно текущей директории
+TEMPLATE_FOLDER = "digit_templates"
+
+# получаем список всех образов для обучения
+templates = folder_scan(os.path.join(RESOURCES_DIR, TEMPLATE_FOLDER))
+templates.sort()
+
+# Для задания числа входных сигналов сети возьмем длину любого шаблона из списка
+len_input_data = len(NumberParser.parse(os.path.join(RESOURCES_DIR, TEMPLATE_FOLDER, templates[0]))[0])
+
+# Создаем нулевой слой сети.
+# number_of_input_signal равен числу входных сигналов.
+# number_neurons_in_layer определяет число нейронов в слое и
+# так же число выходов самого слоя
+layer0 = Layer(name="{}#0".format(NETWORK_NAME),  number_of_input_signal=len_input_data,
+               number_neurons_in_layer=7)
+# При создании второго слоя в сети необходимо выставить number_of_input_signal
+# равным числу выходов предыдущего слоя.
+# Экспериментальное наблюдение: если число нейронов в данном слое (layer1) равно 10,
+# сеть учится наиболее быстро и более устойчива к помехам в образах
+layer1 = Layer(name="{}#1".format(NETWORK_NAME),  number_of_input_signal=7,
+               number_neurons_in_layer=10)
+# Число нейронов в последнем слое в данном случае равно
+# числу распознаваемых образов - длине списка templates
+layer2 = Layer(name="{}#2".format(NETWORK_NAME),  number_of_input_signal=10,
+               number_neurons_in_layer=len(templates))
+
+
+network = Network()
+
+network.add_layer(layer0)
+network.add_layer(layer1)
+network.add_layer(layer2)
+
+# формируем список входных данных шаблонов
+data = []
+for i in range(len(templates)):
+    data.append(NumberParser.parse(os.path.join(RESOURCES_DIR, TEMPLATE_FOLDER, templates[i])))
+
+# learn определяет, нужно ли проводить процесс обучения
+learn = True
+
+if learn:
+    # формируем списки ожидаемого отклика сети.
+    expects = []
+    for i in range(len(templates)):
+        expect = [0 for x in range(len(templates))]
+        expect[i] = 1
+        expects.append(expect)
+    count_epoch = 0
+    result = False
+    while not result:
+        result = True
+        for i in range(len(templates)):
+            if not network.learn(data[i][0], expects[i]):
+                result = False
+        count_epoch += 1
+        if count_epoch % 500 == 0:
+            for i in range(len(templates)):
+                result_set = network.calculate(data[i][0])
+                print("{} -> ".format(data[i][1]), list(map(lambda x: round(x, 3), result_set)))
+            print("----------")
+            # FIXME!!!
+            print("learn temp = ", network._learning_rate)
+    print("COUNT EPOCH = ", count_epoch)
+if learn:
+    network.save_state()
+
+for i in range(len(templates)):
+    result = network.calculate(data[i][0])
+    print("{}) {}  ->\t".format(i+1, data[i][1]), list(map(lambda x: round(x, 3), result)))
+======================
+
+
+======================
+/applications/test_drive_kohonen_layer.py
+"""
+Тест состоит в следующем. Выберим на плоскости несколько точек так, можно было определить
+некую область с центром в данной точке. Для этого удобно выбрать по одной точке в каждой четверти
+координатной плоскости и еще несколько поблизости. Обозначим их A, B, C, D, E.
+Теперь в цикле будет генерировать точки на плоскости XOY с нормальным законом распределения
+с математическим ожиданием A (или B, или C, или D, или E последовательно) и средним квадратическим
+отклонением dispersion и подавать на вход созданного слоя. В результате за N итераций сеть должна
+распределить векторы каждого нейрона таким образом, чтобы он максимально совпадал с математическим
+ожиданием каждого кластера и при подаче на вход точки, принадлежащей одному из классов, сеть должна
+откликнуться единице лишь одним нейроном, а остальные должны выдать нуль.
+
+                                ^
+                                |   
+                                |             
+                                |            B(10, 10)
+                                |           *       C(13, 6)
+                                |                  *
+                                |                 D(5, 4)
+                                |               *
+                                |     A(2, 2)
+                                |   *
+                                |
+       -------------------------|--------------------------->
+                    E(-1, -5)   |
+                   *            |
+                                |
+                                |
+                                |
+                                |
+                                |
+                                |
+                                |
+"""
+from random import gauss
+from entities.counter_propagation.kohonen_layer import KohonenLayer
+
+# точки математического ожидания для обучения
+A = [2, 2]
+B = [10, 10]
+C = [13, 6]
+D = [5, 4]
+E = [-1, -5]
+
+# создаем слой с 4 нейронами (по количеству точек) и числом входов 2
+layer = KohonenLayer(name="test", number_neurons_in_layer=5, number_of_input_signal=2,
+                     use_normalize_data=True, auto_save=False)
+# среднее квадратическое отклонение
+dispersion = 0.1
+
+
+def print_result(count, d, *args):
+    print("*****************************")
+    for arg in args:
+        print("-------------{}".format(arg))
+        for j in range(count):
+            x = [gauss(arg[0], d), gauss(arg[1], d)]
+            print(layer.calculate(x), "\t\t", x)
+        print("--------------------")
+    print("*****************************")
+
+for i in range(1000000):
+    layer.learn([gauss(A[0], dispersion), gauss(A[1], dispersion)])
+    layer.learn([gauss(B[0], dispersion), gauss(B[1], dispersion)])
+    layer.learn([gauss(C[0], dispersion), gauss(C[1], dispersion)])
+    layer.learn([gauss(D[0], dispersion), gauss(D[1], dispersion)])
+    layer.learn([gauss(E[0], dispersion), gauss(E[1], dispersion)])
+    if i % 10000 == 0:
+        print_result(5, dispersion, A, B, C, D, E)
+======================
+
+
+======================
+/main.py
+import os
+import cv2
+from next.next import BASE_DIR
+
+image = cv2.imread(os.path.join(BASE_DIR, "license_plate_recognition", "imgOriginalScene.png"))
+
+
+# load the image, convert it to grayscale, and blur it
+# image = cv2.imread("example.jpg")
+gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+gray = cv2.GaussianBlur(gray, (3, 3), 0)
+cv2.imshow("Gray", gray)
+cv2.waitKey(0)
+
+# detect edges in the image
+edged = cv2.Canny(gray, 10, 250)
+cv2.imshow("Edged", edged)
+cv2.waitKey(0)
+
+# construct and apply a closing kernel to 'close' gaps between 'white'
+# pixels
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+cv2.imshow("Closed", closed)
+cv2.waitKey(0)
+
+# find contours (i.e. the 'outlines') in the image and initialize the
+# total number of books found
+_, contours, _ = cv2.findContours(closed.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+total = 0
+
+# loop over the contours
+for c in contours:
+	# approximate the contour
+	peri = cv2.arcLength(c, True)
+	approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+
+	# if the approximated contour has four points, then assume that the
+	# contour is a book -- a book is a rectangle and thus has four vertices
+	if len(approx) == 4:
+		cv2.drawContours(image, [approx], -1, (0, 255, 0), 4)
+		total += 1
+
+# display the output
+print("I found {0} books in that image".format(total))
+cv2.imshow("Output", image)
+cv2.waitKey(0)
+======================
+
+
+======================
+/notification_engine/impl/telegram.py
+import logging
+import requests
+from next.next import Next
+
+
+class TelegramBotNotifier(object):
+    _token = None
+    _chat_id = None
+    _base_url = None
+    _logger = None
+
+    def __init__(self):
+        self._logger = logging.getLogger(__name__)
+        conf = Next.get_instance().get("TELEGRAM_BOT")
+        self._token = conf.get("access_token")
+        self._chat_id = conf.get("chat_id")
+        self._base_url = "https://api.telegram.org/bot%s/" % self._token
+
+    def notify(self, msg, level, *args, **kwargs):
+        self._logger.info("Sending notify message...")
+        url = self._base_url + "sendMessage"
+        self._logger.info(url)
+        if kwargs.get("app_name"):
+            msg = "%s\n%s" % (kwargs.get("app_name"), msg)
+
+        param = {"chat_id": self._chat_id,
+                 "text": msg}
+        self._logger.info("Chat id: %s" % self._chat_id)
+        response = requests.get(url=url, params=param)
+        if kwargs.get("image"):
+            self._logger.debug("Found message: %s" % kwargs.get("image"))
+            self.send_photo(kwargs.get("image"))
+        self._logger.debug(response.text)
+        return response.status_code
+
+    def send_photo(self, photo_src):
+        self._logger.info("Sending photo...")
+        url = self._base_url + "sendPhoto"
+        self._logger.info("Chat id: %s" % self._chat_id)
+        data = {'chat_id': self._chat_id}
+        files = {'photo': ("photo", open(photo_src, "rb"))}
+        response = requests.post(url, data=data, files=files)
+        self._logger.debug(response.text)
+        return response.status_code
+======================
+
+
+======================
+/notification_engine/notification_engine.py
+import os
+import logging
+import importlib.util
+from enum import Enum
+from next.next import Next
+
+
+class NotifyLevel(Enum):
+    DEBUG = 1
+    INFO = 2
+    WARNING = 3
+    ERROR = 4
+    CRITICAL = 5
+
+
+class Notifier(object):
+    _instance = None
+
+    _registry = None
+    _current_dir = None
+    _app_name = None
+    _logger = None
+    _notification_on = None
+
+    @classmethod
+    def get_instance(cls, *args, **kwargs):
+        """
+        Данный метод реализует паттерн проектирования Singleton
+        """
+        if cls._instance is None:
+            cls._instance = super().__new__(cls, *args, **kwargs)
+            # методу __init__ первым аргументом должен передаваться инстанс объекта, но не класс
+            cls.__init__(cls._instance, *args, **kwargs)
+        return cls._instance
+
+    def __init__(self):
+        self._logger = logging.getLogger(__file__)
+        self._current_dir = os.path.dirname(os.path.abspath(__file__))
+        self._app_name = Next.get_instance().get("APPLICATION").get("name")
+        self._notification_on = Next.get_instance().get("NOTIFICATION_ENGINE").get("notification")
+        self._registry = list()
+        self._create_notifiers()
+
+    def _get_all_notify_classes(self):
+        notifiers = os.listdir(os.path.join(self._current_dir, "impl"))
+        notifiers = [_ for _ in notifiers if not _.startswith("__") and _.endswith(".py")]
+        return notifiers
+
+    def _create_notifiers(self):
+        notifiers = self._get_all_notify_classes()
+        for notifier in notifiers:
+            spec = importlib.util.spec_from_file_location(notifier[:-3],
+                                                          os.path.join(self._current_dir, "impl", notifier))
+            notify_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(notify_module)
+            notify_classes = [_ for _ in dir(notify_module) if not _.startswith("__") and "Notifier" in _]
+            for cls in notify_classes:
+                obj = getattr(notify_module, cls)()
+                self._registry.append(obj)
+
+    def notify(self, msg, level=NotifyLevel.DEBUG, **kwargs):
+        if self._notification_on:
+            for notifier in self._registry:
+                try:
+                    notifier.notify(msg, level, app_name=self._app_name, **kwargs)
+                except AttributeError as e:
+                    self._logger.error("Error to call method from obj " + str(e))
+                    self._registry.remove(notifier)
+======================
+
+
+======================
+/REST/auth/auth.py
+import logging
+from store.service.store_service import StoreService
+from REST.auth.client import Client
+
+
+store = StoreService()
+logger = logging.getLogger(__name__)
+
+
+def authenticate(name, password):
+    logger.info("Get client by name: <%s> and password: <%s>" % (name, password))
+    obj = store.get_client(name, password)
+    logger.info("Client: %s" % str(obj))
+    if obj:
+        return Client(obj["id"], obj['name'], obj["password"])
+    return None
+
+
+def identity(payload):
+    client_id = payload['identity']
+    logger.info("Get client by id: <%s>" % client_id)
+    obj = store.get_client_by_id(client_id)
+    logger.info("Client: <%s>" % obj)
+    if obj:
+        return Client(obj["id"], obj['name'], obj["password"])
+    return None
+======================
+
+
+======================
+/REST/auth/client.py
+
+class Client(object):
+    def __init__(self, uuid, name, password):
+        self.id = uuid
+        self.name = name
+        self.password = password
+
+    def __str__(self):
+        return "Client(id='%s')" % self.id
+======================
+
+
+======================
+/REST/exceptions/invalid_usage.py
+
+class InvalidUsage(Exception):
+    _status_code = 400
+    _message = None
+    _payload = None
+
+    def __init__(self, message, status_code=None, payload=None):
+        Exception.__init__(self)
+        self._message = message
+        if status_code:
+            self._status_code = status_code
+        self._payload = payload
+
+    def to_dict(self):
+        rv = dict(self._payload or ())
+        rv['error'] = self._message
+        return rv
+
+    def get_status_code(self):
+        return self._status_code
+======================
+
+
+======================
+/REST/exceptions/handlers.py
+import logging
+
+from flask import jsonify
+
+from notification_engine.notification_engine import Notifier
+
+logger = logging.getLogger(__name__)
+notifier = Notifier.get_instance()
+
+
+def invalid_usage(error):
+    logger.error(str(error))
+    response = jsonify(error.to_dict())
+    response.status_code = error.get_status_code()
+    return response
+
+
+def handle_404(error):
+    logger.error("404:" + str(error))
+    response = jsonify(dict(error=str(error)))
+    response.status_code = 404
+    return response
+
+
+def general_exception(error):
+    logger.critical(str(error))
+    response = jsonify(dict(error="Something went wrong! See log"))
+    response.status_code = 500
+    msg = "Something went wrong!\n"
+    msg += str(error)
+    notifier.notify(msg=msg)
+    return response
+======================
+
+
+======================
+/REST/app.py
+import os
+import logging
+from flask import Flask
+from flask import request
+from flask_restful import Api
+from REST.resources import resources
+from datetime import timedelta
+from flask_jwt import JWT, jwt_required
+from next.next import Next, RESOURCES_DIR
+from REST.auth.auth import authenticate, identity
+from REST.exceptions.invalid_usage import InvalidUsage
+from REST.exceptions.handlers import invalid_usage, handle_404, general_exception
+
+conf = Next.get_instance().get("REST_API")
+
+# print banner
+banner_path = os.path.join(RESOURCES_DIR, "REST", conf.get("server_banner"))
+if os.path.exists(banner_path):
+    with open(banner_path) as f:
+        print(f.read())
+
+
+logger = logging.getLogger(__name__)
+logger.info("JWT secret:{\n\t\t%s\n}" % conf.get("json_web_secret"))
+
+app = Flask(__name__)
+api = Api(app=app, prefix="/api/v1/")
+
+# add resources
+for resource in resources:
+    api.add_resource(resource.get_cls(), resource.get_url())
+
+# catch exceptions in not DEBUG mode
+app.config['PROPAGATE_EXCEPTIONS'] = True
+app.config['JWT_AUTH_USERNAME_KEY'] = 'name'
+app.config['SECRET_KEY'] = conf.get("json_web_secret")
+# how long will token be valid?
+app.config['JWT_EXPIRATION_DELTA'] = timedelta(hours=int(conf.get("jwt_expiration_delta_hours")))
+app.config['JWT_LEEWAY'] = timedelta(seconds=5)
+jwt = JWT(app, authenticate, identity)
+
+
+app.register_error_handler(InvalidUsage, invalid_usage)
+app.register_error_handler(404, handle_404)
+app.register_error_handler(Exception, general_exception)
+
+unsecure_urls = {"/auth"}
+
+
+@app.before_request
+def sure_request():
+
+    @jwt_required()
+    def do_secure():
+        pass
+
+    if request.path not in unsecure_urls:
+        do_secure()
+======================
+
+
+======================
+/REST/resources.py
+from REST.controllers.neuron_network import NeuronNetwork
+
+
+class Resource(object):
+    _cls = None
+    _url = None
+
+    def __init__(self, cls, url):
+        self._cls = cls
+        self._url = url
+
+    def get_cls(self):
+        return self._cls
+
+    def get_url(self):
+        return self._url
+
+
+resources = [
+    Resource(NeuronNetwork, "introspect")
+]
+======================
+
+
+======================
+/REST/access_controller.py
+import logging
+
+
+class AccessController(object):
+    _logger = None
+
+    def __init__(self):
+        self._logger = logging.getLogger(__name__)
+
+    def check_access(self, neuron_response):
+        self._logger.debug("Neuron response: %s" % str(neuron_response))
+        if neuron_response == "a777bc":
+            return True
+        return False
+======================
+
+
+======================
+/REST/controllers/neuron_network.py
+import logging
+import os
+import time
+from datetime import datetime
+
+from flask import request
+from flask_restful import Resource
+from werkzeug.utils import secure_filename
+
+from REST.access_controller import AccessController
+from REST.exceptions.invalid_usage import InvalidUsage
+from next.next import Next, RESOURCES_DIR, set_option, get_option
+from notification_engine.notification_engine import Notifier
+from util.allowed_file_upload import allowed_file_upload
+from util.bmp import bmp_to_binary
+from util.network_aggregation import create_net_from_json
+
+from license_plate_recognition.lpc import LPC
+
+logger = logging.getLogger(__name__)
+
+conf = Next.get_instance().get("REST_API")
+REPO_DIR = os.path.join(RESOURCES_DIR, 'repository')
+IMAGES_DIR = os.path.join(REPO_DIR, "images")
+
+if not os.path.exists(IMAGES_DIR):
+    os.makedirs(IMAGES_DIR)
+
+topology = create_net_from_json(os.path.join(RESOURCES_DIR, "topologies", conf.get("file_topology")))
+network = topology.get("object")
+mapping = topology.get("payload").get("mapping")
+
+notifier = Notifier.get_instance()
+
+
+class NeuronNetwork(Resource):
+    _access_controller = None
+
+    def __init__(self):
+        self._access_controller = AccessController()
+
+    def post(self):
+        checkout = str(int(time.time()))
+        try:
+            image = request.files.get("image")
+            image_name = secure_filename(image.filename)
+            image_name = "%s-%s" % (checkout, image_name)
+            logger.info("Image name from request: %s" % image_name)
+        except AttributeError as e:
+            logger.error(str(e))
+            raise InvalidUsage("Invalid payload", 400)
+
+        if not allowed_file_upload(image_name):
+            msg = "Date: %s\n" % str(datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+            msg += "Remote IP: %s\n" % request.remote_addr
+            msg += "Upload file with name: %s\n" % secure_filename(image.filename)
+            msg += "Invalid payload"
+            notifier.notify(msg=msg)
+            raise InvalidUsage("Invalid payload", 400)
+
+        try:
+            logger.debug("Try to save image %s" % image_name)
+            image.save(os.path.join(IMAGES_DIR, image_name))
+            set_option("trash", [image_name])
+        except Exception as e:
+            logger.error(str(e))
+            raise InvalidUsage("Something went wrong! See logs", 500)
+
+        characters = ""
+        try:
+            for symbols_img in LPC().detect_places(os.path.join(IMAGES_DIR, image_name)):
+                bin_image = bmp_to_binary(os.path.join(IMAGES_DIR, symbols_img))
+                result = network.calculate(bin_image)
+                characters += str(mapping.get(result.index(max(result))))
+        except Exception as e:
+            msg = "Cannot recognize image file %s %s" % image
+            logger.error(msg + str(e))
+            raise InvalidUsage(msg, 500)
+        access = self._access_controller.check_access(neuron_response=characters)
+        msg = "Date: %s\n" % str(datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+        msg += "Remote IP: %s\n" % request.remote_addr
+        msg += "Trying to get access\n"
+        if not access:
+            msg += "Access deny"
+        else:
+            msg += "Access allow"
+        notifier.notify(msg=msg, image=os.path.join(IMAGES_DIR, image_name))
+        if not conf.get("save_images"):
+            for image in get_option("trash"):
+                os.remove(os.path.join(IMAGES_DIR, image))
+        return {"access": access}
+======================
+
+
+======================
+/entities/base_neuron.py
+import logging
+from hashlib import md5
+from random import random
+from store.service.store_service import StoreService
+from next.next import get_option
+
+
+class BaseNeuron(object):
+    _id = None                      # уникальный идентификатор нейрона в рамках конкретного слоя
+    _name = None                    # последовательность символов для удобства идентификации нейрона
+    _number_of_input_signal = None  # число входных сигналов нейрона
+    _weight = None                  # массив весов входных сигналов
+
+    _store_service = None           # объект сервиса, занимающегося хранением и получением состояния нейрона
+    _logger = None
+
+    def __init__(self, name, number_of_input=2, auto_load=True, gen_random_weight=True, store_service=None):
+        """
+        Для идентификации нейрона внутри слоя и внутри сети, для последующего сохранения и
+        загрузки его состояния необходимо некое поле для хранения уникальной
+        последовательности, которая будет являться идентификатором.
+        Для этого используется поле _id, которое хранит md5 хеш.
+        Правило генерации имени нейрона:
+            {имя слоя, которому принадлежит нейрон} + {#} + {порядковый номер нейрона в слое}:
+
+                new_layer#0 - нулевой нейрон в слое с именем "new_layer"
+
+        :param name:                имя нейрона
+        :param number_of_input:     число дендритов нейрона
+        :param auto_load:           автоматическая загрузка состояния при инициализации
+        :param gen_random_weight:   автоматическая генерация весовых коэффициентов по числу входов
+        """
+        self._logger = logging.getLogger(__name__)
+        if name is None:
+            raise ValueError("name must be not None")
+        self._store_service = store_service or get_option("base_neuron_store") or StoreService()
+        self.set_number_of_input_signal(number_of_input)
+        self._name = name
+
+        self._logger.debug("Neuron <{}> is initializing".format(self._name))
+        # генерация уникального идентификатора
+        self._id = self._generate_id()
+
+        if auto_load:
+            load_success = self.load_state()
+            self._logger.debug("Downloading state from storage .... {}".format(load_success))
+            if not load_success and gen_random_weight:
+                self._logger.debug("Generating random weights....")
+                # генерация начальных случайных весов
+                self._weight = self.generate_random_weight(self._number_of_input_signal)
+        self._logger.debug("Initialization success!\n\n")
+
+    def _generate_id(self):
+        if self._name is None:
+            raise ValueError("Name must be not null")
+        # пример генерации взят отсюда
+        # http://stackoverflow.com/questions/5297448/how-to-get-md5-sum-of-a-string
+        return md5(self._name.encode('utf-8')).hexdigest()
+
+    def calculate(self, signals):
+        """
+        Метод для вычисления взвешенной суммы
+        :param signals: список входных сигналов
+        :return: взвешенная сумма
+        """
+        if len(signals) != self._number_of_input_signal:
+            raise ValueError("Число входных сигналов не соответствует числу входов нейрона")
+        result = 0
+        for i in range(self._number_of_input_signal):
+            result += signals[i] * self._weight[i]
+        return result
+
+    @staticmethod
+    def generate_random_weight(number_of_weight):
+        """
+        Метод генерации случайных весов входных сигналов.
+        :param number_of_weight: количество необходимых весов 
+        :return: список случайных весов в пределах от -0.5 до 0.5
+        """
+        weight = []
+        for i in range(number_of_weight):
+            weight.append(random() - 0.5)
+        return weight
+
+    def print_state(self, short_output=True, print_step=10):
+        """
+        Данный метод выводит в консоли текущее состояние нейрона:
+        его уникальный идентификатор, число дендритов и веса.
+        :param short_output: вывод всех весов в консоли
+        :param print_step:  шаг вывода весов
+        :return: 
+        """
+        print("Текущие состояние нейрона <{}>:".format(self._name))
+        print("ID: {}".format(self._id))
+        print("Число дендритов: {}".format(self._number_of_input_signal))
+
+        step = print_step if short_output else 1
+        for i in range(0, len(self._weight), step):
+            print("weight[{}] = {}".format(i, self._weight[i]))
+
+    def set_number_of_input_signal(self, number_of_input_signal):
+        if number_of_input_signal < 2:
+            raise ValueError("Число входов не может быть меньше 2")
+        self._number_of_input_signal = number_of_input_signal
+
+    def set_weight(self, weight):
+        self._weight = weight
+
+    def save_state(self):
+        self._store_service.save_state(self)
+
+    def load_state(self):
+        return self._store_service.load_state(self)
+
+    def get_name(self):
+        return self._name
+
+    def get_id(self):
+        return self._id
+
+    def get_number_of_input_signal(self):
+        return self._number_of_input_signal
+
+    def get_weight(self):
+        return self._weight
+======================
+
+
+======================
+/entities/perceptron.py
+import sys
+from entities.base_neuron import BaseNeuron
+from store.service.store_service import StoreService
+
+
+class Perceptron(BaseNeuron):
+    """
+    Персептронный нейрон
+    Умножает каждый вход на соответствующий вес и суммирует взвешенные входы.
+    Если эта сумма больше заданного порогового значения, выход равен единице,
+    в противном случае – нулю.
+    Использует фиктивный входной сигнал с начальным весом -0.5
+    """
+    _start_weight_x0 = -0.5         # начальный вес фиктивного водного сигнала x0
+    _dummy_signal_x0 = 1            # фиктивный сигнал x0
+    _learning_temp = 0.1            # темп обучения
+    _auto_save = False              # при каждом обучении сохранять ли состояние нейрона?
+
+    def __init__(self, name, number_of_input=2, auto_save=True, store_service=None):
+        store = store_service if store_service else StoreService()
+        super().__init__(name, number_of_input, store_service=store)
+        self._auto_save = auto_save
+        # так как используется фиктивный входной сигнал, то необходимо для
+        # него установить соответствующий вес
+        if len(self._weight) != (number_of_input + 1):
+            self._weight.insert(0, self._start_weight_x0)
+
+    def calculate(self, signals):
+        """
+        Метод для вычисления взвешенной суммы
+        :param signals: список входных сигналов
+        :return: взвешенная сумма после преобразования активационной функцией
+        """
+        if len(signals) != self._number_of_input_signal:
+            raise ValueError("Число входных сигналов не соответствует числу входов нейрона")
+
+        result = self._dummy_signal_x0 * self._weight[0]
+        for i in range(self._number_of_input_signal):
+            # так как x0 не содержится в сигнатуре данного метода, а все веса
+            # хранятся в едином массиве, к индексу очередного веса необходимо
+            # прибавить единицу для правильного соответствия весов сигналам
+            result += signals[i] * self._weight[i+1]
+        return self.activate(result)
+
+    @staticmethod
+    def activate(result):
+        """
+        Функция активации нейрона - функция, вычисляющая выходной сигнал
+        искусственного нейрона. 
+        В данном случае используется пороговая функция активации
+        :param result: взвешенная сумма (метод calculate).
+        :return: 0 или 1
+        """
+        return 0 if result <= 0 else 1
+
+    def learning(self, signals, expect, display=False):
+        """
+        Данный метод проводит обучение нейрона.
+        В случае, если ожидаемый результат совпадает с вычисленным, обучение прекращается.
+        Если же результат не равняется ожидаемому, происходит корректировка весов по
+        следующему принципу:
+                w[i] = w[i] + (expect - result) * signals[i] * learning_temp.
+        Таким образом, в случае, если результат меньше ожидаемого, все веса увеличаться
+        на некоторое значение и наоборот.
+        Если был указан параметр auto_save происходит автоматическая сохранение состояния
+        :param signals: список входных сигналов
+        :param expect: ожидаемый отклик нейрона
+        :param display: будет ли выводится процесс обучения в консоль
+        :return: В случае удачного обучения (результат равен ожидаемому), True, иначе False
+        """
+        result = self.calculate(signals)
+        if display:
+            sys.stdout.write("Обучение нейрона. Входные данные: ")
+            for i in range(len(signals)):
+                sys.stdout.write("x{} = {} ".format(i+1, signals[i]))
+            sys.stdout.write("Результат: {} ".format(result))
+        if result != expect:
+            self._weight[0] += (expect - result) * self._learning_temp * self._dummy_signal_x0
+            for i in range(1, len(self._weight)):
+                self._weight[i] += (expect - result) * signals[i - 1] * self._learning_temp
+            if self._auto_save:
+                self.save_state()
+            if display:
+                print(False)
+            return False
+        if display:
+            print(True)
+        return True
+======================
+
+
+======================
+/entities/ART/receiver2.py
+
+class Receiver2(object):
+    """
+    Выход Приемника 2, равен единице, если входной вектор X имеет хотя бы одну единичную компоненту.
+    Более точно, G2 является логическим ИЛИ от компонента вектора X.
+    """
+    _instance = None
+    _resolution = None
+
+    def __init__(self):
+        self._resolution = False
+
+    @classmethod
+    def get_instance(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls, *args, **kwargs)
+            cls.__init__(cls._instance, *args, **kwargs)
+        return cls._instance
+
+    def gen_resolution(self, x_vector):
+        self._resolution = 1 if 1 in x_vector else 0
+        return self._resolution
+
+    def get_resolution(self):
+        return self._resolution
+
+    def reset_resolution(self):
+        self._resolution = False
+======================
+
+
+======================
+/entities/ART/comparison_neuron.py
+from entities.ART.receiver1 import Receiver1
+
+
+class ComparisonNeuron(object):
+    """
+    Каждый нейрон в слое сравнения получает три двоичных входа:
+    1. компонента хi входного вектора X;
+    2. cигнал обратной связи Ri – взвешенная сумма выходов распознающего слоя;
+    3. вход от Приемника 1 (один и тот же сигнал подается на все нейроны этого слоя).
+    """
+    _receiver1 = None
+
+    def __init__(self):
+        self._receiver1 = Receiver1.get_instance()
+
+    def compare(self, input_signal, Ri):
+        """
+        Чтобы получить на выходе нейрона единичное значение, как минимум два из
+        трех его входов должны равняться единице; в противном случае его выход будет нулевым.
+        Таким образом реализуется правило двух третей.
+        :param input_signal: компонента вектора X
+        :param Ri: компонента вектора R
+        :return: 
+        """
+        resolution = self._receiver1.get_resolution()
+        if sum([resolution, input_signal, Ri]) > 1:
+            return 1
+        else:
+            return 0
+======================
+
+
+======================
+/entities/ART/reset_module.py
+
+
+class ResetModule(object):
+    """
+    Модуль сброса измеряет сходство между векторами X и C.
+    Если они отличаются сильнее, чем требует параметр сходства, вырабатывается сигнал сброса
+    возбужденного нейрона в слое распознавания.
+    """
+
+    @staticmethod
+    def decide(x_vector, c_vector):
+        """
+        В процессе функционирования модуль сброса вычисляет сходство как отношение количества единиц
+        в векторе C к их количеству в векторе C.
+        Если это отношение ниже значения параметра сходства, вырабатывается сигнал сброса.
+        :param x_vector: двоичный вектор входного сигнала
+        :param c_vector: вектор "запомненного" образа
+        :return: 
+        """
+        D = sum(x_vector)
+        N = sum(c_vector)
+        S = N / D
+        if S >= 0.8:
+            return True
+        return False
+======================
+
+
+======================
+/entities/ART/comparison_layer.py
+from entities.ART.comparison_neuron import ComparisonNeuron
+
+
+class ComparisonLayer(object):
+    """
+     Слой сравнения получает двоичный входной вектор Х и первоначально пропускает его неизмененным
+     для формирования выходного вектора "C". На более поздней фазе в распознающем слое вырабатывается
+     двоичный вектор "R", модифицирующий вектор "C".
+    """
+    _comparison_neurons = None
+    _number_of_input = None
+
+    def __init__(self, number_of_input=5):
+        self._number_of_input = number_of_input
+        self._comparison_neurons = [ComparisonNeuron() for _ in range(number_of_input)]
+
+    def compare(self, input_signal, R_vector):
+        if len(input_signal) != self._number_of_input:
+            raise ValueError("Число входных сигналов должно равняться {}".format(self._number_of_input))
+        if len(R_vector) != self._number_of_input:
+            raise ValueError("Длина вектора R должна равняться {}".format(self._number_of_input))
+
+        out = []
+        for i in range(len(input_signal)):
+            out.append(self._comparison_neurons[i].compare(input_signal[i], R_vector[i]))
+        return out
+======================
+
+
+======================
+/entities/ART/network.py
+from entities.ART.comparison_layer import ComparisonLayer
+from entities.ART.receiver1 import Receiver1
+from entities.ART.receiver2 import Receiver2
+from entities.ART.recognize_layer import RecognizeLayer
+from entities.ART.reset_module import ResetModule
+
+
+class Network(object):
+    """
+    Процесс классификации в APT состоит из трех основных фаз: распознавание, сравнение и поиск.
+    """
+    _receiver1 = None           # объект приемника 1
+    _receiver2 = None           # объект приемника 2
+    _comparison_layer = None    # объект слоя сравнения
+    _recognize_layer = None     # объект слоя распознавания
+    _winner_neuron = None       # нейрон, который является победителем в слое распознавания
+    _auto_save = None
+
+    def __init__(self, name, number_of_input, auto_save=True):
+        """
+        :param name: имя сети. На основании данного параметра генерируются
+                    имя слоя распознавания и имена нейронов этого слоя   
+        :param number_of_input: число входов сети - длина вектора данных
+        :param auto_save: автоматическое сохранение состояния сети после обучения нейрона
+        """
+        self._auto_save = auto_save
+        self._receiver1 = Receiver1.get_instance()
+        self._receiver2 = Receiver2.get_instance()
+        self._comparison_layer = ComparisonLayer(number_of_input=number_of_input)
+        self._recognize_layer = RecognizeLayer(name, number_of_input=number_of_input)
+
+    def recognize(self, input_signal):
+        self._recognize_layer.activate_all_neuron()
+        image_found = False
+
+        while self._recognize_layer.get_number_of_active_neuron() > 0:
+            r_vector = self.do_recognition_phase(x_vector=input_signal)
+            c_vector = self.do_comparison_phase(x_vector=input_signal, r_vector=r_vector)
+            response = self.do_search_phase(x_vector=input_signal, c_vector=c_vector)
+            # Если образ из памяти не соответствует входному, возбужденный нейрон в слое распознавания тормозится.
+            # Этот процесс повторяется до тех пор, пока не встретится одно из двух событий:
+            if response:
+                # 1. Найден запомненный образ, сходство которого с вектором input_signal выше уровня параметра сходства.
+                # Проводится обучающий цикл, в процессе которого модифицируются веса векторов T и B,
+                # связанных с возбужденным нейроном в слое распознавания.
+                self.learn(neuron=self._winner_neuron, image=c_vector)
+                image_found = True
+                print("Найден похожий образ")
+                break
+        if image_found:
+            return self._winner_neuron.get_t_vector().copy()
+        print("Образ не найден. Создание нового нейрона...")
+        # 2. Все запомненные образы проверены, определено, что они не соответствуют входному вектору,
+        # и все нейроны слоя распознавания заторможены. В этом случае создается новый нейрон для этого
+        # образа и его весовые векторы B и T устанавливаются соответствующими новому входному образу.
+        new_neuron = self._recognize_layer.create_neuron()
+        self.learn(neuron=new_neuron, image=input_signal)
+        return new_neuron.get_t_vector().copy()
+
+    def do_recognition_phase(self, x_vector):
+        # В начальный момент времени входной вектор отсутствует на входе сети;
+        # следовательно, все компоненты входного вектора X можно рассматривать как нулевые.
+        # Тем самым сигнал G2 устанавливается в 0
+        # следовательно, в нуль устанавливаются выходы всех нейронов слоя распознавания.
+        self._receiver2.reset_resolution()
+        # Затем на вход сети подается входной вектор X, который должен быть классифицирован.
+        # Этот вектор должен иметь одну или более компонент, отличных от нуля,
+        r_vector = self._recognize_layer.recognize(input_signal=x_vector)
+        # в результате чего и G1, и G2 становятся равными единице.
+        self._receiver1.gen_resolution(x_vector, r_vector)
+        self._receiver2.gen_resolution(x_vector)
+        c_vector = self._comparison_layer.compare(x_vector, r_vector)
+        # Для каждого нейрона в слое распознавания вычисляется свертка вектора его весов и вектора C.
+        # Нейрон с максимальным значением свертки имеет веса, наилучшим образом соответствующие входному вектору.
+        # Он выигрывает конкуренцию и возбуждается, одновременно затормаживая все остальные нейроны этого слоя.
+        # Таким образом, единственная компонента Rj вектора R становится равной единице,
+        # а все остальные компоненты становятся равными нулю.
+        r_vector = self._recognize_layer.recognize(input_signal=c_vector)
+        return r_vector
+
+    def do_comparison_phase(self, x_vector, r_vector):
+        # Единственный возбужденный в слое распознавания нейрон возвращает единицу обратно в слой сравнения
+        # в виде своего выходного сигнала Rj
+        # Так как вектор r_vector не является больше нулевым, сигнал receiver1 устанавливается в нуль.
+        # Таким образом, в соответствии с правилом двух третей, возбудиться могут только нейроны,
+        # получающие на входе одновременно единицы от входного вектора X и вектора t_vector.
+        self._receiver1.gen_resolution(x_vector, r_vector)
+        index_winner_neuron = r_vector.index(1)
+        self._winner_neuron = self._recognize_layer.get_neuron_by_index(index_winner_neuron)
+        t_vector = self._winner_neuron.get_t_vector()
+        c_vector = self._comparison_layer.compare(x_vector, t_vector)
+        return c_vector
+
+    def do_search_phase(self, x_vector, c_vector):
+        if ResetModule.decide(x_vector, c_vector):
+            # Если не выработан сигнал сброса, сходство является адекватным,
+            # и процесс классификации завершается.
+            return True
+        # В противном случае другие запомненные образы должны быть исследованы
+        # с целью поиска лучшего соответствия.
+        self._winner_neuron.turn_off()
+        return False
+
+    def learn(self, neuron, image):
+        """
+        Обучение представляет собой процесс, в котором набор входных векторов подается последовательно на
+        вход сети и веса сети изменяются при этом таким образом, чтобы сходные векторы активизировали
+        соответствующие нейроны. Это – неуправляемое обучение, нет учителя и нет целевого вектора,
+        определяющего требуемый ответ.
+        :param neuron: 
+        :return: 
+        """
+        s = sum(image)
+        weights = [2*i / (2 - 1 + s) for i in image]
+        neuron.set_weights(weights)
+        neuron.set_t_vector(image.copy())
+        if self._auto_save:
+            neuron.save_state()
+            self.save_state(layer_only=True)
+
+    def save_state(self, layer_only=False):
+        """
+        Сохранение состояния сети
+        :param layer_only: сохранить только список нейронов в слое без сохранения состояния нейронов
+        :return: 
+        """
+        self._recognize_layer.save_state(layer_only)
+======================
+
+
+======================
+/entities/ART/receiver1.py
+
+
+class Receiver1(object):
+    """
+    Выходной сигнал Приемника 1 (G1) равен 1, если хотя бы одна компонента двоичного входного вектора X равна единице;
+    однако если хотя бы одна компонента вектора R равна единице, G1 устанавливается в нуль.
+    Таблица, определяющая эти соотношения:"""
+    _instance = None
+    _resolution = None
+
+    def __init__(self):
+        self._resolution = True
+
+    @classmethod
+    def get_instance(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls, *args, **kwargs)
+            cls.__init__(cls._instance, *args, **kwargs)
+        return cls._instance
+
+    def gen_resolution(self, x_vector, r_vector):
+        if 1 in r_vector:
+            self._resolution = False
+            return False
+
+        if 1 in x_vector:
+            self._resolution = True
+            return True
+
+    def get_resolution(self):
+        return self._resolution
+
+    def reset_resolution(self):
+        self._resolution = True
+======================
+
+
+======================
+/entities/ART/recognize_neuron.py
+import sys
+from math import exp
+from store.service.store_service import StoreService
+from util.id_generator import generate_id
+
+
+class RecognizeNeuron(object):
+    """
+    В процессе функционирования каждый нейрон слоя распознавания вычисляет свертку
+    вектора собственных весов и входного вектора C.
+    Нейрон, имеющий веса, наиболее близкие вектору C, будет иметь самый большой выход,
+    тем самым выигрывая соревнование и одновременно затормаживая все остальные нейроны в слое.
+    """
+    _is_ready = None
+    _t_vector = None
+    _weight = None
+    _number_of_input = None
+    _store_service = None
+    _name = None
+    _id = None
+
+    def __init__(self, name, number_of_input):
+        self._store_service = StoreService()
+        self._is_ready = True
+        self._number_of_input = number_of_input
+        self._name = name
+        self._id = generate_id(name)
+        sys.stdout.write("Создание нейрона < {} >. Загрузка состояния :".format(name))
+        load_success = self._store_service.load_state(obj=self, mode="ART.neuron")
+        print(load_success)
+        if not load_success:
+            # Веса вектора инициализируются в одинаковые малые значения.
+            # Эти значения должны удовлетворять условию:
+            # weight < L / (L - 1 + number_of_input), обычно L = 2
+            weight = 2 / (1 + number_of_input) - 0.01
+            self._weight = [weight for _ in range(number_of_input)]
+            # Веса вектора T все инициализируются в единичные значения
+            self._t_vector = [1 for _ in range(number_of_input)]
+
+    def wrap(self, input_signal):
+        """
+        В процессе функционирования каждый нейрон слоя распознавания вычисляет свертку вектора
+        собственных весов и входного вектора C.
+        Нейрон, имеющий веса, наиболее близкие вектору C, будет иметь самый большой выход,
+        тем самым выигрывая соревнование и одновременно затормаживая все остальные нейроны в слое.
+        :param input_signal: входной вектор C
+        :return: 
+        """
+        response = 0
+        for i in range(self._number_of_input):
+            response += input_signal[i] * self._weight[i]
+        return response
+        # conv = convolve(input_signal, self._weight, "same")
+        # return sum(conv)
+
+    @staticmethod
+    def activate(result, alpha=1):
+        """
+        Функция активации нейрона - функция, вычисляющая выходной сигнал
+        искусственного нейрона. На вход принимает значение,
+        полученной от сумматора (метод calculate).
+        В данном методе применяется сигмоидальная функция активации,
+        значения которой лежат в интервале от 0 до 0.(9)
+        Ссылка на статью, посвященную описанию функций активации:
+        http://www.aiportal.ru/articles/neural-networks/activation-function.html
+        :param result: 
+        :param alpha:   параметр наклона сигмоидальной функции активации, изменяя
+                        этот параметр, можно построить функции с различной крутизной.
+        :return: 
+        """
+        return 1.0 / (1 + exp(-alpha * result))
+
+    def get_t_vector(self):
+        return self._t_vector
+
+    def get_name(self):
+        return self._name
+
+    def get_id(self):
+        return self._id
+
+    def get_number_of_input(self):
+        return self._number_of_input
+
+    def get_weight(self):
+        return self._weight
+
+    def turn_off(self):
+        self._is_ready = False
+
+    def turn_on(self):
+        self._is_ready = True
+
+    def is_ready(self):
+        return self._is_ready
+
+    def set_weights(self, weights):
+        if len(weights) != self._number_of_input:
+            raise ValueError("Число весов должно равняться {}".format(self._number_of_input))
+        self._weight = weights
+
+    def set_t_vector(self, t_vector):
+        self._t_vector = t_vector
+
+    def save_state(self):
+        self._store_service.save_state(obj=self, mode="ART.neuron")
+
+======================
+
+
+======================
+/entities/ART/recognize_layer.py
+from entities.ART.receiver2 import Receiver2
+from entities.ART.recognize_neuron import RecognizeNeuron
+from store.service.store_service import StoreService
+from util.id_generator import generate_id
+
+
+class RecognizeLayer(object):
+    """
+    Слой распознавания осуществляет классификацию входных векторов.
+    Каждый нейрон в слое распознавания имеет соответствующий вектор весов.
+    Только один нейрон с весовым вектором, наиболее соответствующим входному вектору, возбуждается;
+    все остальные нейроны заторможены.
+    """
+    _recognize_neurons = None
+    _receiver2 = None
+    _number_of_input = None
+    _store_service = None
+    _r_vector = None
+    _name = None
+    _id = None
+
+    def __init__(self, name, number_of_input):
+        self._name = name + "#RecognizeLayer#"
+        self._id = generate_id(name + "#RecognizeLayer#")
+        self._number_of_input = number_of_input
+        self._store_service = StoreService()
+        self._receiver2 = Receiver2.get_instance()
+        self._r_vector = [0 for _ in range(number_of_input)]
+        neuron_list = self._store_service.get_recognize_neuron_list(self._id)
+        self._recognize_neurons = []
+        if neuron_list:
+            print("Найдены сохраненные образы...")
+        for neuron_name in neuron_list:
+            self.create_neuron(neuron_name)
+
+    def create_neuron(self, name=None):
+        if name:
+            neuron_name = name
+        else:
+            neuron_name = self._name + str(len(self._recognize_neurons)+1)
+        neuron = RecognizeNeuron(name=neuron_name, number_of_input=self._number_of_input)
+        self._recognize_neurons.append(neuron)
+        return neuron
+
+    def recognize(self, input_signal):
+        if len(input_signal) != self._number_of_input:
+            raise ValueError("Число входных сигналов должно равняться {}".format(self._number_of_input))
+
+        if not self._receiver2.get_resolution():
+            self._r_vector = [0 for i in range(self._number_of_input)]
+            return self._r_vector
+
+        self._r_vector = []
+        for neuron in self._recognize_neurons:
+            if neuron.is_ready():
+                self._r_vector.append(neuron.wrap(input_signal))
+            else:
+                self._r_vector.append(0)
+        index_winner_neuron = self._r_vector.index(max(self._r_vector))
+        self._r_vector = [1 if i == index_winner_neuron else 0 for i in range(self._number_of_input)]
+        return self._r_vector
+
+    def activate_all_neuron(self):
+        for neuron in self._recognize_neurons:
+            neuron.turn_on()
+
+    def get_neuron_by_index(self, index):
+        return self._recognize_neurons[index]
+
+    def get_r_vector(self):
+        return self._r_vector
+
+    def get_neuron_list(self):
+        return self._recognize_neurons
+
+    def save_state(self, layer_only=False):
+        """
+        Сохранение состояния слоя
+        :param layer_only: если True - сохраняется только список нейронов в слое
+        """
+        self._store_service.save_state(obj=self, mode="ART.layer")
+        if not layer_only:
+            for neuron in self._recognize_neurons:
+                neuron.save_state()
+
+    def get_number_of_active_neuron(self):
+        count = 0
+        for neuron in self._recognize_neurons:
+            if neuron.is_ready():
+                count += 1
+        return count
+
+    def get_id(self):
+        return self._id
+======================
+
+
+======================
+/entities/backpropagation/neuron.py
+from math import exp
+from entities.base_neuron import BaseNeuron
+
+
+class Neuron(BaseNeuron):
+
+    def __init__(self, name, number_of_input=2):
+        super().__init__(name, number_of_input)
+
+    def calculate(self, signals):
+        """
+        Метод для вычисления результаты работы нейрона
+        :param signals: список входных сигналов, 0 или 1
+        :return: 
+        """
+        result = super().calculate(signals)
+        return self.activate(result)
+
+    @staticmethod
+    def activate(result, alpha=1):
+        """
+        Функция активации нейрона - функция, вычисляющая выходной сигнал
+        искусственного нейрона. На вход принимает значение,
+        полученной от сумматора (метод calculate).
+        В данном методе применяется сигмоидальная функция активации,
+        значения которой лежат в интервале от 0 до 0.(9)
+        Ссылка на статью, посвященную описанию функций активации:
+        http://www.aiportal.ru/articles/neural-networks/activation-function.html
+        :param result: 
+        :param alpha:   параметр наклона сигмоидальной функции активации, изменяя
+                        этот параметр, можно построить функции с различной крутизной.
+        :return: 
+        """
+        return 1.0 / (1 + exp(-alpha * result))
+======================
+
+
+======================
+/entities/backpropagation/network.py
+import math
+
+import logging
+
+
+class Network(object):
+    _layers = None              # список слоев в сети
+    _auto_save = False          # автоматическое сохранение состояния слоев после обучения
+
+    _tolerance = 0.1            # допустимая ошибка при обучении сети
+    _learning_rate = 0.1        # темп обучения
+    _correct_lear_rate = None   # автоматическая постройка скорости обучения
+    _logger = None
+
+    def __init__(self, auto_save=False, auto_correct_learn_rate=True, learn_rate=None):
+        self._logger = logging.getLogger(__name__)
+        self._layers = []
+        self._auto_save = auto_save
+        self._correct_lear_rate = auto_correct_learn_rate
+        if learn_rate:
+            self._learning_rate = learn_rate
+
+    def add_layer(self, layer, index=None):
+        """
+        Добавление слоев в сеть
+        :param layer: объект слоя
+        :param index: место в списке _layers. Если не указан, то добавиться в конец
+        :return: 
+        """
+        if index:
+            self._layers.insert(index, layer)
+        else:
+            self._layers.append(layer)
+
+    def calculate(self, input_signals):
+        """
+        Метод для вычисления результата работы сети
+        На вход первому слою подается набор input_signals,
+        далее результат работы каждого слоя подается на вход следующему слою
+        :param input_signals: входной сигнал для сети
+        :return: список выходов последнего слоя в сети
+        """
+        intermediate = self._layers[0].calculate(input_signals)
+        for i in range(1, len(self._layers)):
+            intermediate = self._layers[i].calculate(intermediate)
+        return intermediate
+
+    def learn(self, input_signal, expect):
+        """
+        Метод для обучения сети.
+        http://www.aiportal.ru/articles/neural-networks/back-propagation.html
+        Алгоритм обучения отличается для последнего и скрытых слоев, поэтому они
+        разделены на два отдельных метода.
+        :param input_signal: набор входных данных для обучения
+        :param expect: ожидаемый отклик сети на input_signal
+        :return: True, если ошибка не превышает _tolerance, иначе False
+        """
+
+        # алгоритм для постройки весов использует результат работы
+        # предыдущего слоя, поэтому необходимо сначала получить результат
+        # работы для каждого слоя
+        self.calculate(input_signal)
+
+        if self._correct_lear_rate:
+            self._correct_learn_rate(expect)
+
+        # формируем список входных сигналов для последнего слоя сети.
+        # Если в сети более одного слоя, то для последнего слоя входные
+        # данные - результат работы предыдущего слоя.
+        data = input_signal
+        if len(self._layers) > 1:
+            data = self._layers[-2].get_result_set()
+        out = self._learn_last_layer(data, expect)
+        # если ошибка превысила порог, выполняем подстроку весов всех
+        # скрытых слоев
+        if not out:
+            # обратный цикл начиная с предпоследнего слоя в сети
+            for i in range(len(self._layers)-2, -1, -1):
+                # Алгоритм обратного распространения ошибки использует для подстройки
+                # весов текущего слоя в качестве входных сигналов результат работы
+                # предыдущего слоя для последнего слоя входным сигналом является
+                # список input_signal для каждого следующего - результат работы предыдущего слоя
+                if i == 0:
+                    input_data = input_signal
+                else:
+                    input_data = self._layers[i-1].get_result_set()
+                self._learn_hidden_layer(layer_index=i, input_data=input_data)
+
+        return out
+
+    def _learn_last_layer(self, source_signal, expect):
+        """
+        Подстройка весов выходного слоя.
+        Так как для каждого нейрона выходного слоя задано целевое значение,
+        то подстройка весов легко осуществляется с использованием модифицированного дельта-правила
+        :param source_signal: список входных сигналов для последнего слоя
+        :param expect: список ожидаемого отклика сети
+        :return: результат обучения сети. True, если ошибка меньше _tolerance, иначе False
+        """
+        learn_complete = True
+        # получаем объект последнего слоя в сети
+        layer = self._layers[-1]
+        # получаем ссылку на список
+        sigmas = layer.get_sigmas()
+        # получаем список нейронов в слое
+        neurons = layer.get_neuron_list()
+        # получаем результат работы последнего слоя
+        result_set = layer.get_result_set()
+        for i in range(len(neurons)):
+            # Если модуль разности полученного значения больше допустимого порога
+            # ошибки _tolerance, корректируем веса текущего нейрона
+            if math.fabs(result_set[i] - expect[i]) > self._tolerance:
+                learn_complete = False
+                neuron_weight = neurons[i].get_weight()
+                # введем переменную сигма, равную разности между требуемым expect[i] и реальным result
+                # выходами, умноженной на производную функции активации
+                sigma = result_set[i] * (1 - result_set[i]) * (expect[i] - result_set[i])
+                sigmas[i] = sigma
+                for j in range(len(neuron_weight)):
+                    neuron_weight[j] += sigma * source_signal[j] * self._learning_rate
+        if not learn_complete and self._auto_save:
+            layer.save_state()
+        return learn_complete
+
+    def _learn_hidden_layer(self, layer_index, input_data):
+        """
+        Подстройка весов скрытых слоев      
+        :param layer_index: номер слоя в сети
+        :param input_data: список входных сигналов для слоя
+        :return: 
+        """
+        # получаем список нейронов слоя
+        neurons = self._layers[layer_index].get_neuron_list()
+        # получаем список ошибок sigma текущего слоя
+        sigmas = self._layers[layer_index].get_sigmas()
+        # получаем результат работы слоя
+        result_set = self._layers[layer_index].get_result_set()
+        for i in range(len(neurons)):
+            neuron = neurons[i]
+            result = result_set[i]
+            # введем переменную сигма, равную производной функции активации, умноженной
+            # на взвешенную сумму сигм следующего слоя
+            sigma = result * (1 - result) * self._layers[layer_index+1].get_weighted_synaptic_sum(i)
+            sigmas[i] = sigma
+            neuron_weight = neuron.get_weight()
+            for j in range(len(neuron_weight)):
+                neuron_weight[j] += self._learning_rate * sigma * input_data[j]
+        if self._auto_save:
+            self._layers[layer_index].save_state()
+
+    def _correct_learn_rate(self, expect):
+        """
+        Метод динамически изменяет темп обучения нейрона в зависимости от величины
+        Вычисляем сумму квадратов разности между ожидаемым откликом сети (expect)
+        и реально полученными значениями. Затем нормируем полученную сумму на количество
+        нейронов в слое и извлекаем корень - то есть получаем среднее значение ошибки.
+        Это значение плюс некоторое число, ужно для задания некоторого нижнего порога
+        скорости и является темпом обучения     
+        :param expect: 
+        :return: 
+        """
+        squared_sum_errors = 0
+        result = self._layers[-1].get_result_set()
+        for i in range(len(expect)):
+            squared_sum_errors += (expect[i] - result[i]) ** 2
+        avg_error = math.sqrt(squared_sum_errors / len(result))
+        self._learning_rate = avg_error + 0.05
+
+    def save_state(self):
+        for layer in self._layers:
+            layer.save_state()
+
+    def get_all_neurons(self):
+        neurons = []
+        for layer in self._layers:
+            for neuron in layer.get_neuron_list():
+                neurons.append(neuron)
+        return neurons
+
+    def get_input_size(self):
+        if not self._layers:
+            return None
+        return self._layers[0].get_input_size()
+
+    def get_learn_rate(self):
+        return self._learning_rate
+
+======================
+
+
+======================
+/entities/backpropagation/layer.py
+from entities.backpropagation.neuron import Neuron
+
+
+class Layer(object):
+    _name = None                    # используется для генерации имен нейронов, принадлежащих слою
+    _neurons = None                 # список всех нейронов данного слоя
+    _result_set = None              # список, содержащий результат работы каждого нейрона в слое
+    _number_of_input_signal = None  # число входных сигналов слоя
+    _sigmas = None                  # список поправок сигма
+    _auto_save = False              # при каждом обучении сохранять ли состояние слоя
+
+    def __init__(self, name, number_neurons_in_layer=2, number_of_input_signal=2,
+                 auto_save=False):
+        """
+        Имена нейронов генерируются автоматически на основании имени слоя.
+        Правило формирования имени нейрона описано в комментарии к конструктору нейрона.
+        Правило формирования имени слоя следующее:
+            {имя сети} + {#} + {порядковый номер слоя, начиная с 0}:
+                number_search#5 - пятый слой в сети number_search
+
+        :param name: необходимо для формирования имени нейрона
+        :param number_neurons_in_layer: число нейронов в слое - число выходов слоя
+        :param number_of_input_signal: число входов слоя (так же число входов каждого нейрона в слое)
+        :param auto_save: автоматическое сохранение состояния каждого нейрона
+        """
+        if name is None or name == "":
+            raise ValueError("name must be not None")
+        self._name = name
+        self._number_of_input_signal = number_of_input_signal
+        self._sigmas = [0 for i in range(number_neurons_in_layer)]
+        self._auto_save = auto_save
+        # инициализация нейронов в слое
+        # так как список передается по ссылке, то для того, чтобы у каждого объекта
+        # класса Layer был свой список _neurons, нужно присвоить этой ссылке новый пустой список
+        self._neurons = []
+        for i in range(number_neurons_in_layer):
+            neuron_name = name + "#" + str(i)
+            neuron = Neuron(name=neuron_name, number_of_input=number_of_input_signal)
+            self._neurons.append(neuron)
+
+    def calculate(self, input_data):
+        """
+        Метод подает на вход каждому нейрону в сети массив входных данных.
+        @:return список, содержащий результат работы каждого нейрона в self._neurons
+        :param input_data: список входных данных
+        :return: список, содержащий результат работы каждого нейрона в self._neurons
+        """
+        self._result_set = []
+        for neuron in self._neurons:
+            result = neuron.calculate(input_data)
+            self._result_set.append(result)
+        return self._result_set
+
+    def get_weighted_synaptic_sum(self, index):
+        """
+        Метод возвращает взвешенную синаптическую сумму. Это необходимо для
+        алгоритма обратного распространения ошибки на этапе подстройки весов
+        скрытого слоя. В цикле проходим по всем нейронам в слоя, получаем у
+        каждого нейрона i-ый вес и умножаем на соответствующую сигму, вычисленную
+        на этапе обучения
+        :param index: индекс необходимого веса 
+        :return: 
+        """
+        synaptic_sum = 0
+        for i in range(len(self._neurons)):
+            neuron_weight = self._neurons[i].get_weight()[index]
+            synaptic_sum += neuron_weight * self._sigmas[i]
+        return synaptic_sum
+
+    def save_state(self):
+        for neuron in self._neurons:
+            neuron.save_state()
+
+    def get_neuron_list(self):
+        return self._neurons
+
+    def get_sigmas(self):
+        return self._sigmas
+
+    def get_result_set(self):
+        return self._result_set
+
+    def get_input_size(self):
+        return self._number_of_input_signal
+======================
+
+
+======================
+/entities/counter_propagation/kohonen_layer.py
+from math import sqrt
+from entities.counter_propagation.kohonen_neuron import KohonenNeuron
+
+
+class KohonenLayer(object):
+    """
+        В своей простейшей форме слой Кохонена функционирует в духе «победитель забирает все»,
+        т. е. для данного входного вектора один и только один нейрон Кохонена выдает на выходе
+        логическую единицу, все остальные выдают ноль. Нейроны Кохонена можно воспринимать
+        как набор электрических лампочек, так что для любого входного вектора загорается одна из них.
+        Слой Кохонена классифицирует входные векторы в группы схожих.
+        Это достигается с помощью такой подстройки весов слоя Кохонена,
+        что близкие входные векторы активируют один и тот же нейрон данного слоя.
+    """
+    _name = None                    # используется для генерации имен нейронов, принадлежащих слою
+    _neurons = None                 # список всех нейронов данного слоя
+    _result_set = None              # список, содержащий результат работы каждого нейрона в слое
+    _number_of_input_signal = None  # число входных сигналов слоя
+    _auto_save = False              # автоматическое сохранение состояния слоя после обучения
+    _learn_rate = 0.3               # скорость обучения
+    _normalize = False              # нормализовывать ли входные данные
+
+    def __init__(self, name, number_neurons_in_layer=2, number_of_input_signal=2,
+                 auto_save=False, use_normalize_data=False):
+        if name is None or name == "":
+            raise ValueError("name must be not None")
+        name += "{kohonen_layer}"
+        self._number_of_input_signal = number_of_input_signal
+        self._name = name
+        self._auto_save = auto_save
+        self._normalize = use_normalize_data
+        # инициализация нейронов в слое
+        # так как список передается по ссылке, то для того, чтобы у каждого объекта
+        # класса Layer был свой список _neurons, нужно присвоить этой ссылке новый пустой список
+        self._neurons = []
+        for i in range(number_neurons_in_layer):
+            neuron_name = name + "#" + str(i)
+            neuron = KohonenNeuron(name=neuron_name, number_of_input=number_of_input_signal)
+            self._neurons.append(neuron)
+
+    def calculate(self, input_signal):
+        """
+        Метод подает на вход каждому нейрону в сети массив входных данных.
+        Далее интерпретируем полученный результат с помощью метода _interpret_calc_result
+        :param input_signal: список входных сигналов
+        :return: список, содержащий одну единицу - номер "нейрона-победителя"
+        """
+        if self._normalize:
+            input_signal = self.prepared_input_signal(input_signal)
+        result_set = []
+        for neuron in self._neurons:
+            result = neuron.calculate(input_signal)
+            result_set.append(result)
+        return self._interpret_calc_result(result_set)
+
+    @staticmethod
+    def _interpret_calc_result(result_set):
+        """
+        Данный метод ищет "нейрон-победитель" - максимальный элемент в списке result_set,
+        присваивает этому элементу значение 1, остальные приравнивает к нулю
+        :param result_set: отклик слоя на сходные данные
+        :return: 
+        """
+        min_element = min(result_set)
+        index_min_element = result_set.index(min_element)
+        result_set = [1 if i == index_min_element else 0 for i in range(len(result_set))]
+        return result_set
+
+    def learn(self, input_signal):
+        """
+        В сетях Кохонена используется обучение без учителя.
+        При подаче на вход сети вектора x побеждает тот нейрон,
+        вектор весов которого в наименьшей степени отличаются от входного вектора.
+        Чаще всего в качестве меры расстояния используется евклидова мера
+        Подстройка веса выполняется следующим образом:
+            Wnew = Wold + α(X–Wold)
+        Wnew - новое значение веса, после корректировки
+        Wold - значение веса до корректировки
+        X - соответствующая компонента входного сигнала
+        α - скорость обучения
+        :param input_signal: набор входных сигналов
+        """
+        if self._normalize:
+            input_signal = self.prepared_input_signal(input_signal)
+        result_set = []
+        for neuron in self._neurons:
+            weights = neuron.get_weight()
+            deviation = 0
+            for i in range(len(weights)):
+                deviation += (input_signal[i] - weights[i]) ** 2
+            result_set.append(deviation)
+        min_deviation = min(result_set)
+        index_of_winner_neuron = result_set.index(min_deviation)
+        winner_neuron = self._neurons[index_of_winner_neuron]
+        weights_neuron = winner_neuron.get_weight()
+        for i in range(len(weights_neuron)):
+            weights_neuron[i] += self._learn_rate * (input_signal[i] - weights_neuron[i])
+        if self._auto_save:
+            winner_neuron.save_state()
+
+    @staticmethod
+    def prepared_input_signal(source_signal):
+        """
+        Предварительная обработка входных векторов. Весьма желательно (хотя и не обязательно) 
+        нормализовать входные векторы перед тем, как предъявлять их сети. 
+        Это выполняется с помощью деления каждой компоненты входного вектора на длину вектора. 
+        Эта длина находится извлечением квадратного корня из суммы квадратов компонент вектора.
+        :param source_signal: 
+        :return: 
+        """
+        norma = sqrt(sum([x ** 2 for x in source_signal]))
+        signals = [x / norma for x in source_signal]
+        return signals
+
+    def save_state(self):
+        for neuron in self._neurons:
+            neuron.save_state()
+======================
+
+
+======================
+/entities/counter_propagation/kohonen_neuron.py
+from math import sqrt
+from random import random
+from entities.base_neuron import BaseNeuron
+
+
+class KohonenNeuron(BaseNeuron):
+
+    def __init__(self, name, number_of_input=2):
+        neuron_name = name + "{kohonen_neuron}"
+        # для нейрона Кохонена первоначальная инициализация весов
+        # выполняется не генерацией случайных чисел, поэтому выключим автоматическую
+        super().__init__(neuron_name, number_of_input, gen_random_weight=False)
+        # присваиваем всем весам нейрона Кохонена значение по
+        # методу выпуклой комбинации (convex combination method)
+        # Информация взята из книги Ф.Уоссермена "Нейрокомпьютерная техника: Теория и практика"
+        # Глава 4. "Сети встречного распространения"
+        # присваивать веса нужно только в том случае, если они не были взяты из
+        # хранилища
+        if not self._weight:
+            norma = 1 / sqrt(number_of_input)
+            # К каждому весу прибавляем небольшое отклонение
+            normal_weight = [norma + 0.1 * random() for i in range(number_of_input)]
+            self.set_weight(normal_weight)
+
+    def calculate(self, source_signals):
+        """
+        Режим функционирования нейрона Кохонена заключается в вычислении скалярного
+        произведения вектора весов на вектор входных сигналов. Фактически это можно
+        интерпретировать как поиск наилучшего соответствия вектора входного сигнала
+        к вектору весов одного из нейронов. Выигрывает тот нейрон, у которого скалярное
+        произведение самое большое - максимальное соответствие вектору входных сигналов
+        :param source_signals: список входных сигналов
+        :return: 
+        """
+        return super().calculate(source_signals)
+======================
+
+
+======================
+/store/impl/file_store.py
+import hashlib
+import os
+import shutil
+from next.next import Next, RESOURCES_DIR
+from werkzeug.security import safe_str_cmp
+
+
+class FileStore(object):
+    """
+    Данный класс предназначен сохранения состояний нейрона в файловом хранилище.
+    Для получения объект класса необходимо вызвать статический метод get_instance
+    """
+    _instance = None
+    _base_neuron_folder = None
+    _art_layers_folder = None
+    _art_neurons_folder = None
+
+    @classmethod
+    def get_instance(cls, *args, **kwargs):
+        """
+        Данный метод реализует паттерн проектирования Singleton
+        """
+        if cls._instance is None:
+            cls._instance = super().__new__(cls, *args, **kwargs)
+            # методу __init__ первым аргументом должен передаваться инстанс объекта, но не класс
+            cls.__init__(cls._instance, *args, **kwargs)
+        return cls._instance
+
+    def __init__(self, store_folder=None):
+        if not store_folder:
+            store_folder = Next.get_instance().get("FILE_STORE").get("base_folder")
+        self._store_folder = store_folder
+        # каталог для хранения базовых нейронов
+        self._base_neuron_folder = os.path.join(RESOURCES_DIR, store_folder, "baseNeurons")
+        # каталог для хранения слоев ART
+        self._art_layers_folder = os.path.join(RESOURCES_DIR, store_folder, "ART", "layers")
+        # каталог для хранения нейронов ART
+        self._art_neurons_folder = os.path.join(RESOURCES_DIR, store_folder, "ART", "neurons")
+
+        self.create_service_folder()
+
+    def clean(self):
+        """
+        Удаляет состояния всех слоев и нейронов в хранилище
+        http://stackoverflow.com/a/303225
+        :return: 
+        """
+        shutil.rmtree(os.path.join(RESOURCES_DIR, self._store_folder))
+        self.create_service_folder()
+
+    def create_service_folder(self):
+        """
+        Создает все необходимые каталоги
+        :return: 
+        """
+        if not os.path.exists(self._base_neuron_folder):
+            os.makedirs(self._base_neuron_folder)
+        if not os.path.exists(self._art_layers_folder):
+            os.makedirs(self._art_layers_folder)
+        if not os.path.exists(self._art_neurons_folder):
+            os.makedirs(self._art_neurons_folder)
+
+    def save_state(self, obj, mode):
+        """
+        Точка входа для сохранения объектов
+        :param obj: сохраняемый объект
+        :param mode: режим сохранения:
+                        baseNeuron  - сохранение объекта родительского класса BaseNeuron
+                        ART.neuron  - сохранение объекта класса RecognizeNeuron
+                        ART.layer   - сохранение объекта класса RecognizeLayer
+        """
+        if mode == "baseNeuron":
+            self.save_base_neuron(obj)
+        if mode == "ART.layer":
+            self.save_art_layer(obj)
+        if mode == "ART.neuron":
+            self.save_recognize_neuron(obj)
+
+    def load_state(self, obj, mode):
+        if mode == "baseNeuron":
+            return self.load_base_neuron(obj)
+        if mode == "ART.neuron":
+            return self.load_recognize_neuron(obj)
+
+    def save_base_neuron(self, neuron):
+        """
+        Метод для сохранения текущего состояния объекта.
+        Формат файла:
+        I строка    - name
+        II строка   - id
+        III число дендритов
+        последующие строки являются значением весов по одному на строке
+        :param neuron: 
+        :return: 
+        """
+        network_name = neuron.get_name()[:neuron.get_name().index("]")+1]
+        if not os.path.exists(os.path.join(self._base_neuron_folder, network_name)):
+            os.makedirs(os.path.join(self._base_neuron_folder, network_name))
+
+        try:
+            with open(os.path.join(self._base_neuron_folder, network_name, neuron.get_id()), "w") as f:
+                f.write("{}\n".format(neuron.get_name()))
+                f.write("{}\n".format(neuron.get_id()))
+                f.write("{}\n".format(neuron.get_number_of_input_signal()))
+                for weight in neuron.get_weight():
+                    f.write(str(weight) + '\n')
+            return True
+        except:
+            print("Не удалось сохранить текущее состояние")
+            return False
+
+    def load_base_neuron(self, neuron):
+        load_success = False
+
+        network_name = neuron.get_name()[:neuron.get_name().index("]")+1]
+
+        try:
+            with open(os.path.join(self._base_neuron_folder, network_name, neuron.get_id())) as f:
+                # читаем имя нейрона (для пропуска)
+                f.readline().strip()
+                # читаем id нейрона (для пропуска)
+                f.readline().strip()
+                number_of_input_signal = int(f.readline().strip())
+                if number_of_input_signal != neuron.get_number_of_input_signal():
+                    raise ValueError
+                weight = []
+                for line in f:
+                    weight.append(float(line))
+                neuron.set_weight(weight)
+                load_success = True
+        except Exception:
+            pass
+        return load_success
+
+    def save_art_layer(self, layer):
+        id = layer.get_id()
+        neurons = layer.get_neuron_list()
+        file = None
+        try:
+            file = open(self._art_layers_folder + id, "w")
+            for neuron in neurons:
+                file.write(neuron.get_name() + "\n")
+        except:
+            print("Не удалось сохранить текущее состояние слоя {}".format(layer.get_id()))
+        finally:
+            if file:
+                file.close()
+
+    def save_recognize_neuron(self, neuron):
+        """
+        Сохранение нейрона в файл.
+        Формат файла:
+        первые N строк - веса нейрона
+        последующие N строк - вектор T, где N - число входов нейрона
+        :return: 
+        """
+        file = None
+
+        try:
+            file = open(self._art_neurons_folder + neuron.get_id(), "w")
+            for i in range(neuron.get_number_of_input()):
+                file.write("{}\n".format(neuron.get_weight()[i]))
+            for i in range(neuron.get_number_of_input()):
+                file.write("{}\n".format(neuron.get_t_vector()[i]))
+        except Exception:
+            print("Не удалось сохранить текущее состояние нейрона")
+        finally:
+            if file:
+                file.close()
+
+    def load_recognize_neuron(self, neuron):
+        load_success = False
+        file = None
+
+        try:
+            file = open(self._art_neurons_folder + neuron.get_id(), "r")
+            weights = []
+            for i in range(neuron.get_number_of_input()):
+                weights.append(float(file.readline().strip()))
+            neuron._weight = weights
+            t_vector = []
+            for i in range(neuron.get_number_of_input()):
+                t_vector.append(int(file.readline().strip()))
+            neuron._t_vector = t_vector
+            load_success = True
+        except Exception:
+            pass
+        finally:
+            if file:
+                file.close()
+        return load_success
+
+    def get_recognize_neuron_list(self, layer_id):
+        """
+        На основании id слоя получаем список всех нейронов, которые принадлежат данному слою
+        :param layer_id: идентификатор слоя
+        :return: список имен нейронов
+        """
+        neurons = []
+        file = None
+        try:
+            file = open(self._art_layers_folder + layer_id, "r")
+            for line in file:
+                neurons.append(line.rstrip())
+        except Exception:
+            pass
+        finally:
+            if file:
+                file.close()
+        return neurons
+
+    def get_client(self, name, password):
+        if safe_str_cmp(name, "sysadm"):
+            if hashlib.sha256(password.encode()).hexdigest() == hashlib.sha256("sysadm".encode()).hexdigest():
+                return dict(name="sysadm",
+                            password=hashlib.sha256("sysadm".encode()).hexdigest(),
+                            id="7f71c693ea8549478de9054abfaf7f6f")
+
+    def get_client_by_id(self, uuid):
+        if uuid == "7f71c693ea8549478de9054abfaf7f6f":
+            return dict(name="sysadm",
+                        password=hashlib.sha256("sysadm".encode()).hexdigest(),
+                        id="7f71c693ea8549478de9054abfaf7f6f")
+======================
+
+
+======================
+/store/impl/perceptron_mock_store.py
+
+class PerseptronMockStoreService(object):
+    """
+    Mock персистентного хранилища для Персептрона.
+    Не выполняет никаких реальных операций по сохранению и загрузке
+    состояния нейрона.
+    """
+
+    def save_state(self, obj, mode="baseNeuron"):
+        pass
+
+    def load_state(self, obj, mode="baseNeuron"):
+        pass
+
+    def clean(self):
+        pass
+======================
+
+
+======================
+/store/impl/mongodb_store.py
+import pymongo
+# url_connection = "mongodb://user:password@host:port/?authSource=admin"
+from next.next import Next
+
+
+class MongoStore(object):
+    _instance = None
+    _connection = None
+    _db = None
+
+    @classmethod
+    def get_instance(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls, *args, **kwargs)
+            cls.__init__(cls._instance, *args, **kwargs)
+        return cls._instance
+
+    def save_state(self, obj, mode):
+        if mode == "baseNeuron":
+            self.save_base_neuron(obj)
+
+    def load_state(self, obj, mode):
+        if mode == "baseNeuron":
+            return self.load_base_neuron(obj)
+
+    def __init__(self):
+        config = Next.get_instance().get("MONGODB")
+        url_connection = "mongodb://{}:{}@{}:{}/?authSource={}".format(
+            config["user"],
+            config["password"],
+            config["host"],
+            config["port"],
+            config["authsource"]
+        )
+        self.connection = pymongo.MongoClient(url_connection)
+        self._db = self.connection[config["db_name"]]
+
+    def save_base_neuron(self, neuron):
+        current_state = {"name": neuron.get_name(),
+                         "id": neuron.get_id(),
+                         "number_of_input_signal": neuron.get_number_of_input_signal(),
+                         "weight": neuron.get_weight()}
+
+        data = self._db.neurons.find_one({"id": neuron.get_id()})
+        if data is not None:
+            self._db.neurons.update({"id": neuron.get_id()}, current_state)
+        else:
+            self._db.neurons.save(current_state)
+
+    def load_base_neuron(self, neuron):
+        resource = self._db.neurons.find_one({"id": neuron.get_id()})
+        if not resource:
+            return False
+        neuron.set_weight(resource["weight"])
+        return True
+
+======================
+
+
+======================
+/store/service/store_service.py
+from next.next import Next
+from store.impl.file_store import FileStore
+from store.impl.mongodb_store import MongoStore
+
+
+store_type_mapping = {
+    "MONGODB": MongoStore,
+    "FILE_SYSTEM": FileStore
+}
+
+
+class StoreService(object):
+    """
+    объект класса StoreService - основной объект, с которым взаимодействует
+    нейрон с целью сохранения и получения своего состояния.
+    При инициализации на основании StoreType задается тип хранилища,
+    с которым будет работать сам StoreService.
+    """
+    _instance = None
+    _store = None
+
+    def __init__(self, store_type=""):
+        if not store_type:
+            config = Next.get_instance().get("STORE")
+            self._store = store_type_mapping.get(config.get("store_type")).get_instance()
+
+    def save_state(self, obj, mode="baseNeuron"):
+        self._store.save_state(obj, mode)
+
+    def load_state(self, obj, mode="baseNeuron"):
+        return self._store.load_state(obj, mode)
+
+    def get_recognize_neuron_list(self, layer_id):
+        return self._store.get_recognize_neuron_list(layer_id)
+
+    def get_client(self, name, password):
+        return self._store.get_client(name, password)
+
+    def get_client_by_id(self, uuid):
+        return self._store.get_client_by_id(uuid)
+
+    def clean(self):
+        """
+        Удаляет состояния всех слоев и нейронов в хранилище
+        :return: 
+        """
+        self._store.clean()
+======================
+
+
+======================
+/wsgi.py
+from REST.app import app
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=True)
+======================

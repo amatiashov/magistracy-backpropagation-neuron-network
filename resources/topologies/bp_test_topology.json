@@ -1,0 +1,12 @@
+{
+  "network": {
+    "name": "IMAGES_BMP[55-60-10]",
+    "auto_rate": true,
+    "rate": 0.07,
+    "input_size": 10000
+  },
+  "payload": {
+      "template_folder": "group_images_bp",
+      "recognize_folder": "number_for_recognize"
+  }
+}

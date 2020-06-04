@@ -1,0 +1,22 @@
+---
+APPLICATION:
+- name: log_level
+  value: DEBUG
+  sys_environment: APP_LOG_LEVEl
+  required: True
+- name: log_folder
+  value: logs
+  sys_environment: APP_LOG_FOLDER
+- name: name
+  value: Neuron Server
+  sys_environment: APP_NAME
+
+STORE:
+- name: store_type
+  value: FILE_SYSTEM
+  sys_environment: STORE_TYPE
+
+FILE_STORE:
+- name: base_folder
+  value: repository/states
+  sys_environment: FILE_STORE_BASE_FOLDER

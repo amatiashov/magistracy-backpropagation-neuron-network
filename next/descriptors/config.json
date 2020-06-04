@@ -1,0 +1,14 @@
+{
+  "APPLICATION": [
+    {
+      "name": "log_level",
+      "value": "DEBUG",
+      "sys_environment": "APP_LOG_LEVEl"
+    },
+    {
+      "name": "log_folder",
+      "value": "logs",
+      "sys_environment": "APP_LOG_FOLDER"
+    }
+  ]
+}

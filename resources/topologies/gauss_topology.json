@@ -1,0 +1,12 @@
+{
+  "network": {
+    "name": "INTER-[10-100-100-2]",
+    "auto_rate": true,
+    "rate": 0.5,
+    "input_size": 250000
+  },
+  "payload": {
+      "template_folder": "inter_templates",
+      "recognize_folder": "inter_recognize"
+  }
+}
